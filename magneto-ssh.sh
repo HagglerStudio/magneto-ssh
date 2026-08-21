@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION="1.7.000"
+VERSION="1.8.000"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 CONFIG_DIR="${HOME}/.magneto-ssh"
@@ -940,7 +940,7 @@ _ssl_check() {
 cmd_housekeeping() {
     local name="" tail_lines=20 download=true out_dir="" log_path="" disk_path_override=""
     local make_report=true check_ssl=true domain_override=""
-    local check_speed=true url_override=""
+    local check_speed=true url_override="" check_uptime=true
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -955,12 +955,13 @@ cmd_housekeeping() {
             --domain)        domain_override="${2:-}"; shift 2 ;;
             --no-pagespeed)  check_speed=false; shift ;;
             --url)           url_override="${2:-}"; shift 2 ;;
+            --no-uptime)     check_uptime=false; shift ;;
             --rules)         REPORT_CLASSIFIER="rules"; shift ;;
             *)               [[ -z "${name}" ]] && name="$1"; shift ;;
         esac
     done
 
-    [[ -n "${name}" ]] || die "Usage: magneto-ssh housekeeping <name> [--tail N] [--no-download] [--no-report] [--no-ssl] [--no-pagespeed]
+    [[ -n "${name}" ]] || die "Usage: magneto-ssh housekeeping <name> [--tail N] [--no-download] [--no-report] [--no-ssl] [--no-pagespeed] [--no-uptime]
        [--output DIR] [--log PATH] [--disk PATH] [--domain HOST] [--url URL]"
     server_exists "${name}" || die "Server '${name}' not found. Run: magneto-ssh list"
 
@@ -1161,9 +1162,23 @@ REMOTE
         printf '\n'
     fi
 
-    # ── 6. Exception report ──────────────────────────────────────────────────
+    # ── 6. Uptime ────────────────────────────────────────────────────────────
+    if [[ "${check_uptime}" == true ]]; then
+        local uptime_url="${url_override}"
+        [[ -z "${uptime_url}" ]] && uptime_url=$(read_field "${file}" FRONTEND_URL)
+
+        printf "${BOLD}6) Uptime (last 7 days)${NC}\n"
+        if [[ -z "${uptime_url}" ]]; then
+            warn "  No FRONTEND_URL set — skipped. Run: magneto-ssh edit ${name}"
+        else
+            _uptime_check "${uptime_url}" || exit_status=1
+        fi
+        printf '\n'
+    fi
+
+    # ── 7. Exception report ──────────────────────────────────────────────────
     if [[ "${make_report}" == true && -n "${downloaded_log}" ]]; then
-        printf "${BOLD}6) Exception report${NC}\n"
+        printf "${BOLD}7) Exception report${NC}\n"
         _run_report "${downloaded_log}" "${name}" \
             "${downloaded_log%.log}.xlsx" || exit_status=1
         printf '\n'
@@ -1175,6 +1190,209 @@ REMOTE
         warn "Housekeeping found issues on ${CYAN}${name}${NC}.\n"
     fi
     return ${exit_status}
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── UptimeRobot ──────────────────────────────────────────────────────────────
+
+# Reads the monitor matching a URL and reports the 7-day uptime ratio, average
+# response time and any down events in that window. Supports both the v2 API
+# (api_key in the POST body) and v3 (bearer token), probed in that order.
+_uptime_fetch() {
+    python3 - <<'PYEOF'
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+V2_URL = "https://api.uptimerobot.com/v2/getMonitors"
+V3_URL = "https://api.uptimerobot.com/v3/monitors"
+WINDOW_DAYS = 7
+
+
+def host_of(url):
+    parsed = urllib.parse.urlparse(url if "://" in url else f"https://{url}")
+    return (parsed.hostname or url).lower().lstrip("www.")
+
+
+def post_v2(api_key):
+    body = urllib.parse.urlencode({
+        "api_key": api_key,
+        "format": "json",
+        "custom_uptime_ratios": str(WINDOW_DAYS),
+        "response_times": "1",
+        "response_times_average": "86400",
+        "logs": "1",
+    }).encode()
+    request = urllib.request.Request(
+        V2_URL, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(request, timeout=45) as response:
+        return json.load(response)
+
+
+def get_v3(api_key):
+    request = urllib.request.Request(
+        f"{V3_URL}?limit=50", headers={"Authorization": f"Bearer {api_key}"})
+    with urllib.request.urlopen(request, timeout=45) as response:
+        return json.load(response)
+
+
+def normalize_v2(payload):
+    if payload.get("stat") != "ok":
+        message = payload.get("error", {}).get("message", "unknown error")
+        raise RuntimeError(f"v2: {message}")
+    monitors = []
+    for monitor in payload.get("monitors", []):
+        ratios = str(monitor.get("custom_uptime_ratio", "")).split("-")
+        monitors.append({
+            "name": monitor.get("friendly_name", ""),
+            "url": monitor.get("url", ""),
+            "up": monitor.get("status") == 2,
+            "ratio": ratios[0] if ratios and ratios[0] else "",
+            "response": monitor.get("average_response_time", ""),
+            "events": [
+                log for log in monitor.get("logs", [])
+                if log.get("type") == 1                     # 1 = down
+            ],
+        })
+    return monitors
+
+
+def normalize_v3(payload):
+    monitors = []
+    items = payload.get("data") or payload.get("monitors") or []
+    for monitor in items:
+        monitors.append({
+            "name": monitor.get("friendlyName") or monitor.get("friendly_name", ""),
+            "url": monitor.get("url", ""),
+            "up": str(monitor.get("status", "")).lower() in ("2", "up", "active"),
+            "ratio": monitor.get("uptimeRatio") or monitor.get("uptime_ratio") or "",
+            "response": monitor.get("averageResponseTime")
+            or monitor.get("average_response_time", ""),
+            "events": [],
+        })
+    return monitors
+
+
+def main():
+    api_key = os.environ.get("UPTIMEROBOT_API_KEY", "").strip()
+    target = host_of(os.environ.get("MSSH_URL", ""))
+    if not api_key:
+        print("ERR|no UPTIMEROBOT_API_KEY set")
+        return 0
+
+    monitors = None
+    errors = []
+    for label, call, shape in (("v2", post_v2, normalize_v2),
+                               ("v3", get_v3, normalize_v3)):
+        try:
+            monitors = shape(call(api_key))
+            print(f"API|{label}")
+            break
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", "replace")
+            errors.append(f"{label} HTTP {error.code} {' '.join(body.split())[:80]}")
+        except Exception as error:                             # noqa: BLE001
+            errors.append(f"{label} {error}")
+
+    if monitors is None:
+        print(f"ERR|{'; '.join(errors)[:160]}")
+        return 0
+    if not monitors:
+        print("ERR|the key returned no monitors")
+        return 0
+
+    match = next((m for m in monitors if host_of(m["url"]) == target), None)
+    if match is None:
+        names = ", ".join(host_of(m["url"]) for m in monitors[:6])
+        print(f"ERR|no monitor for {target} (found: {names})")
+        return 0
+
+    print("OK|{}|{}|{}|{}|{}".format(
+        match["name"], "up" if match["up"] else "DOWN",
+        match["ratio"] or "n/a", match["response"] or "n/a",
+        len(match["events"])))
+
+    for event in match["events"][:5]:
+        print("EVENT|{}|{}".format(
+            event.get("datetime", ""), event.get("duration", "")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+}
+
+# _uptime_check <url> — returns 1 when the monitor is down or the ratio is poor.
+_uptime_check() {
+    local url="$1"
+    local status=0
+
+    command -v python3 &>/dev/null || { warn "  python3 not installed — skipped."; return 0; }
+
+    if [[ -z "${UPTIMEROBOT_API_KEY:-}" && -f "${CONFIG_DIR}/.env" ]]; then
+        UPTIMEROBOT_API_KEY=$(grep '^UPTIMEROBOT_API_KEY=' "${CONFIG_DIR}/.env" 2>/dev/null \
+                              | head -1 | cut -d'=' -f2- || true)
+        export UPTIMEROBOT_API_KEY
+    fi
+
+    local results
+    results=$(MSSH_URL="${url}" _uptime_fetch) || {
+        err "  UptimeRobot request failed."
+        return 1
+    }
+
+    local api_version="" got_data=false
+    while IFS='|' read -r kind a b c d e; do
+        case "${kind}" in
+            API)
+                api_version="${a}"
+                ;;
+            ERR)
+                warn "  ${a}"
+                ;;
+            OK)
+                got_data=true
+                printf "  %-14s %s\n" "Monitor"  "${a}"
+                printf "  %-14s %s\n" "State"    "${b}"
+                printf "  %-14s %s\n" "Uptime 7d" "${c}%"
+                printf "  %-14s %s\n" "Avg response" "${d} ms"
+                printf "  %-14s %s\n" "Down events" "${e}"
+
+                [[ "${b}" == "up" ]] || status=1
+                # Compare as integers scaled by 100 — bash has no float maths.
+                if [[ "${c}" =~ ^[0-9.]+$ ]]; then
+                    local scaled; scaled=$(printf '%.0f' "$(echo "${c} 100" | awk '{print $1*$2}')")
+                    if   (( scaled < 9900 )); then status=1
+                    elif (( scaled < 9990 )); then warn "  Uptime under 99.9% this week."
+                    fi
+                fi
+                ;;
+            EVENT)
+                printf "    ${DIM}down %s for %ss${NC}\n" "${a}" "${b}"
+                ;;
+        esac
+    done <<< "${results}"
+
+    [[ -n "${api_version}" ]] && printf "  ${DIM}API: %s${NC}\n" "${api_version}"
+
+    printf '\n'
+    if [[ "${got_data}" != true ]]; then
+        warn "  Uptime unknown — no monitor data."
+        return 0
+    fi
+    if [[ ${status} -eq 0 ]]; then
+        ok "  Uptime healthy."
+    else
+        err "  Uptime needs attention."
+    fi
+    return ${status}
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2114,7 +2332,7 @@ ${BOLD}Commands:${NC}
   ${CYAN}filezilla${NC} <name>         Open server in FileZilla (SFTP)
   ${CYAN}tunnel${NC}   <name>          Create SSH tunnel to remote DB (localhost:TUNNEL_LOCAL_PORT)
   ${CYAN}dbeaver${NC}  <name>          Open tunnel + launch DBeaver with DB connection
-  ${CYAN}housekeeping${NC} <name>     Indexers + disk + SSL + PageSpeed + exception.log report
+  ${CYAN}housekeeping${NC} <name>     Indexers, disk, SSL, PageSpeed, uptime, exception report
   ${CYAN}report${NC} <name>            Prioritized exception.log report as xlsx
   ${CYAN}version${NC}                  Print version and check for updates
   ${CYAN}update${NC}                   Update magneto-ssh to latest version
@@ -2142,6 +2360,7 @@ ${BOLD}housekeeping options:${NC}
   --domain HOST     Check this host's certificate instead of FRONTEND_URL's
   --no-pagespeed    Skip the PageSpeed Insights run
   --url URL         Measure this URL instead of FRONTEND_URL
+  --no-uptime       Skip the UptimeRobot check
 
 ${BOLD}report options:${NC}
   --file PATH       Analyse a local log instead of downloading one
@@ -2154,6 +2373,10 @@ ${BOLD}report options:${NC}
 ${BOLD}PageSpeed:${NC}  export PAGESPEED_API_KEY=...  (or put it in ~/.magneto-ssh/.env)
   Key from https://console.cloud.google.com — optional, but without one Google
   rate-limits the anonymous quota quickly.
+
+${BOLD}UptimeRobot:${NC}  export UPTIMEROBOT_API_KEY=...  (or ~/.magneto-ssh/.env)
+  A read-only key from the UptimeRobot dashboard is enough. The monitor is
+  matched to the server's FRONTEND_URL host.
 
 ${BOLD}Gemini:${NC}  export GEMINI_API_KEY=...   (key from https://aistudio.google.com/apikey)
   Priorities are cached in ~/.magneto-ssh/priority-map.json, so repeat errors

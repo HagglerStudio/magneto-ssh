@@ -192,7 +192,7 @@ magneto-ssh housekeeping myproject_stage
 magneto-ssh hk myproject_stage
 ```
 
-One SSH round-trip, five checks plus a report:
+One SSH round-trip, six checks plus a report:
 
 1. **exception.log** — reads `<PROJECT_DIR>/var/log/exception.log`, reports size, line count and
    last-modified time, prints the last lines, and downloads a timestamped copy to
@@ -208,7 +208,10 @@ One SSH round-trip, five checks plus a report:
    performance, accessibility, best-practices and SEO scores plus LCP/CLS/INP field data. Each run
    is appended to `~/.magneto-ssh/reports/<name>/pagespeed.md` so trends stay visible. Takes about
    a minute; skip it with `--no-pagespeed`.
-6. **Exception report** — builds the prioritized xlsx described below from the log it just
+6. **Uptime** — reads the UptimeRobot monitor whose URL matches `FRONTEND_URL` and reports the
+   7-day uptime ratio, average response time and any down events in that window. Skip it with
+   `--no-uptime`.
+7. **Exception report** — builds the prioritized xlsx described below from the log it just
    downloaded. Skip it with `--no-report`.
 
 Exits with status `1` when any check fails, so it can be used in scripts.
@@ -225,6 +228,7 @@ Exits with status `1` when any check fails, so it can be used in scripts.
 | `--domain HOST` | Check this host's certificate instead of `FRONTEND_URL`'s |
 | `--no-pagespeed` | Skip the PageSpeed Insights run |
 | `--url URL` | Measure this URL instead of `FRONTEND_URL` |
+| `--no-uptime` | Skip the UptimeRobot check |
 
 ### Exception log report
 
@@ -255,6 +259,10 @@ outranks an `ERROR` from a mistyped password.
 **PageSpeed key.** Set `PAGESPEED_API_KEY`, or put it in `~/.magneto-ssh/.env` as
 `PAGESPEED_API_KEY=...`. The API also answers without a key, but Google throttles the anonymous
 quota quickly once the check runs regularly.
+
+**UptimeRobot key.** Set `UPTIMEROBOT_API_KEY`, or add it to `~/.magneto-ssh/.env`. A read-only
+key is enough — the tool only reads. Both the v2 API (key in the POST body) and v3 (bearer token)
+are supported; whichever the key works against is used, and the version is printed.
 
 **Classification.** Set `GEMINI_API_KEY` (free key from
 [aistudio.google.com/apikey](https://aistudio.google.com/apikey)) and only the
