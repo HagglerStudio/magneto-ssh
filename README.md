@@ -17,6 +17,7 @@ Pure Bash — no Python, no pip, no venv.
 | `filezilla` | `filezilla` command — SFTP file manager | `sudo apt install filezilla` |
 | `dbeaver` or `dbeaver-ce` | `dbeaver` command — database GUI | [dbeaver.io](https://dbeaver.io/download/) |
 | `lsof` | Tunnel port management | Pre-installed |
+| `openssl` | SSL expiry check in `housekeeping` | Pre-installed |
 | `openpyxl` | `report` command — xlsx output | `pip install --user openpyxl` |
 
 Minimum required for core commands (`add`, `ssh`, `list`, etc.): **ssh + sshpass**.
@@ -191,7 +192,7 @@ magneto-ssh housekeeping myproject_stage
 magneto-ssh hk myproject_stage
 ```
 
-One SSH round-trip, three checks plus a report:
+One SSH round-trip, four checks plus a report:
 
 1. **exception.log** — reads `<PROJECT_DIR>/var/log/exception.log`, reports size, line count and
    last-modified time, prints the last lines, and downloads a timestamped copy to
@@ -200,7 +201,10 @@ One SSH round-trip, three checks plus a report:
    and flags any indexer that is not Ready.
 3. **Disk usage** — runs `df -h` on `DISK_PATH` (default `~/application/`), warning at 80% used and
    erroring at 90%.
-4. **Exception report** — builds the prioritized xlsx described below from the log it just
+4. **SSL certificate** — connects to the host in `FRONTEND_URL` on port 443 and reads the
+   certificate: issuer, issue and expiry dates, days remaining. Warns under 30 days, errors under
+   7 days or when expired. Runs locally, not over SSH.
+5. **Exception report** — builds the prioritized xlsx described below from the log it just
    downloaded. Skip it with `--no-report`.
 
 Exits with status `1` when any check fails, so it can be used in scripts.
@@ -213,6 +217,8 @@ Exits with status `1` when any check fails, so it can be used in scripts.
 | `--log PATH` | Override the log path |
 | `--disk PATH` | Override the `df -h` path for this run |
 | `--no-report` | Skip the xlsx exception report |
+| `--no-ssl` | Skip the SSL certificate check |
+| `--domain HOST` | Check this host's certificate instead of `FRONTEND_URL`'s |
 
 ### Exception log report
 

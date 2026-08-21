@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION="1.5.000"
+VERSION="1.6.000"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 CONFIG_DIR="${HOME}/.magneto-ssh"
@@ -892,9 +892,54 @@ _hk_rquote() {
     fi
 }
 
+# _ssl_check <domain> — print certificate dates and days left.
+# Returns 1 when the certificate is expired or expires within a week.
+_ssl_check() {
+    local domain="$1"
+    local cert
+    cert=$(timeout 20 openssl s_client -connect "${domain}:443" -servername "${domain}" \
+           </dev/null 2>/dev/null | openssl x509 -noout -startdate -enddate -issuer 2>/dev/null) || true
+
+    if [[ -z "${cert}" ]]; then
+        err "  Could not read a certificate from ${domain}:443."
+        return 1
+    fi
+
+    local not_before not_after issuer
+    not_before=$(printf '%s\n' "${cert}" | grep '^notBefore=' | cut -d'=' -f2-)
+    not_after=$(printf  '%s\n' "${cert}" | grep '^notAfter='  | cut -d'=' -f2-)
+    issuer=$(printf     '%s\n' "${cert}" | grep '^issuer='    | sed 's/.*O *= *//; s/,.*//')
+
+    printf "  %-14s %s\n" "Domain"    "${domain}"
+    printf "  %-14s %s\n" "Issuer"    "${issuer:-unknown}"
+    printf "  %-14s %s\n" "Issued"    "${not_before}"
+    printf "  %-14s %s\n" "Expires"   "${not_after}"
+
+    local end_epoch now_epoch days
+    end_epoch=$(date -d "${not_after}" +%s 2>/dev/null) || {
+        warn "  Could not parse the expiry date."
+        return 0
+    }
+    now_epoch=$(date +%s)
+    days=$(( (end_epoch - now_epoch) / 86400 ))
+
+    if (( days < 0 )); then
+        err "  Certificate EXPIRED ${days#-} day(s) ago."
+        return 1
+    elif (( days <= 7 )); then
+        err "  Expires in ${days} day(s) — renew now."
+        return 1
+    elif (( days <= 30 )); then
+        warn "  Expires in ${days} day(s)."
+    else
+        ok "  Valid for ${days} more day(s)."
+    fi
+    return 0
+}
+
 cmd_housekeeping() {
     local name="" tail_lines=20 download=true out_dir="" log_path="" disk_path_override=""
-    local make_report=true
+    local make_report=true check_ssl=true domain_override=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -905,12 +950,14 @@ cmd_housekeeping() {
             --disk)          disk_path_override="${2:-}"; shift 2 ;;
             --report)        make_report=true; shift ;;
             --no-report)     make_report=false; shift ;;
+            --no-ssl)        check_ssl=false; shift ;;
+            --domain)        domain_override="${2:-}"; shift 2 ;;
             --rules)         REPORT_CLASSIFIER="rules"; shift ;;
             *)               [[ -z "${name}" ]] && name="$1"; shift ;;
         esac
     done
 
-    [[ -n "${name}" ]] || die "Usage: magneto-ssh housekeeping <name> [--tail N] [--no-download] [--no-report] [--output DIR] [--log PATH] [--disk PATH]"
+    [[ -n "${name}" ]] || die "Usage: magneto-ssh housekeeping <name> [--tail N] [--no-download] [--no-report] [--no-ssl] [--output DIR] [--log PATH] [--disk PATH] [--domain HOST]"
     server_exists "${name}" || die "Server '${name}' not found. Run: magneto-ssh list"
 
     local file; file=$(server_file "${name}")
@@ -983,6 +1030,7 @@ REMOTE
     }
 
     local exit_status=0
+    local downloaded_log=""
 
     # ── 1. Indexer status ────────────────────────────────────────────────────
     printf "${BOLD}1) Indexer status${NC}\n"
@@ -1061,11 +1109,7 @@ REMOTE
             printf '\n'
             if _scp_fetch "${name}" "$(_hk_rquote "${log_path}")" "${dest}"; then
                 ok "  Downloaded → ${CYAN}${dest}${NC}"
-                if [[ "${make_report}" == true ]]; then
-                    printf "\n${BOLD}4) Exception report${NC}\n"
-                    _run_report "${dest}" "${name}" \
-                        "${dest%.log}.xlsx" || exit_status=1
-                fi
+                downloaded_log="${dest}"
             else
                 err "  Download failed: ${log_path}"
                 exit_status=1
@@ -1074,6 +1118,37 @@ REMOTE
     fi
 
     printf '\n'
+
+    # ── 4. SSL certificate ───────────────────────────────────────────────────
+    if [[ "${check_ssl}" == true ]]; then
+        local frontend_url domain
+        frontend_url=$(read_field "${file}" FRONTEND_URL)
+        domain="${domain_override}"
+        if [[ -z "${domain}" && -n "${frontend_url}" ]]; then
+            domain="${frontend_url#*://}"
+            domain="${domain%%/*}"
+            domain="${domain%%:*}"
+        fi
+
+        printf "${BOLD}4) SSL certificate${NC}\n"
+        if [[ -z "${domain}" ]]; then
+            warn "  No FRONTEND_URL set — skipped. Run: magneto-ssh edit ${name}"
+        elif ! command -v openssl &>/dev/null; then
+            warn "  openssl not installed — skipped."
+        else
+            _ssl_check "${domain}" || exit_status=1
+        fi
+        printf '\n'
+    fi
+
+    # ── 5. Exception report ──────────────────────────────────────────────────
+    if [[ "${make_report}" == true && -n "${downloaded_log}" ]]; then
+        printf "${BOLD}5) Exception report${NC}\n"
+        _run_report "${downloaded_log}" "${name}" \
+            "${downloaded_log%.log}.xlsx" || exit_status=1
+        printf '\n'
+    fi
+
     if [[ ${exit_status} -eq 0 ]]; then
         ok "Housekeeping clean for ${CYAN}${name}${NC}.\n"
     else
@@ -1855,7 +1930,7 @@ ${BOLD}Commands:${NC}
   ${CYAN}filezilla${NC} <name>         Open server in FileZilla (SFTP)
   ${CYAN}tunnel${NC}   <name>          Create SSH tunnel to remote DB (localhost:TUNNEL_LOCAL_PORT)
   ${CYAN}dbeaver${NC}  <name>          Open tunnel + launch DBeaver with DB connection
-  ${CYAN}housekeeping${NC} <name>     Indexer status + disk usage + exception.log report
+  ${CYAN}housekeeping${NC} <name>     Indexers + disk + SSL expiry + exception.log report
   ${CYAN}report${NC} <name>            Prioritized exception.log report as xlsx
   ${CYAN}version${NC}                  Print version and check for updates
   ${CYAN}update${NC}                   Update magneto-ssh to latest version
@@ -1879,6 +1954,8 @@ ${BOLD}housekeeping options:${NC}
   --log PATH        Override exception.log path (default <PROJECT_DIR>/var/log/exception.log)
   --disk PATH       Override df -h path (default DISK_PATH, else ~/application/)
   --no-report       Skip the xlsx exception report (built by default)
+  --no-ssl          Skip the SSL certificate expiry check
+  --domain HOST     Check this host's certificate instead of FRONTEND_URL's
 
 ${BOLD}report options:${NC}
   --file PATH       Analyse a local log instead of downloading one
