@@ -1204,9 +1204,11 @@ _uptime_fetch() {
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 
 V2_URL = "https://api.uptimerobot.com/v2/getMonitors"
 V3_URL = "https://api.uptimerobot.com/v3/monitors"
@@ -1215,7 +1217,9 @@ WINDOW_DAYS = 7
 
 def host_of(url):
     parsed = urllib.parse.urlparse(url if "://" in url else f"https://{url}")
-    return (parsed.hostname or url).lower().lstrip("www.")
+    # removeprefix, not lstrip — lstrip strips characters and would turn
+    # "wine.com" into "ine.com".
+    return (parsed.hostname or url).lower().removeprefix("www.")
 
 
 def post_v2(api_key):
@@ -1243,6 +1247,7 @@ def get_v3(api_key):
 
 
 def normalize_v2(payload):
+    window_start = int(time.time()) - WINDOW_DAYS * 86400
     if payload.get("stat") != "ok":
         message = payload.get("error", {}).get("message", "unknown error")
         raise RuntimeError(f"v2: {message}")
@@ -1255,9 +1260,12 @@ def normalize_v2(payload):
             "up": monitor.get("status") == 2,
             "ratio": ratios[0] if ratios and ratios[0] else "",
             "response": monitor.get("average_response_time", ""),
+            # The API returns recent logs regardless of the ratio window, so
+            # filter them down or the event count contradicts the percentage.
             "events": [
                 log for log in monitor.get("logs", [])
                 if log.get("type") == 1                     # 1 = down
+                and int(log.get("datetime", 0)) >= window_start
             ],
         })
     return monitors
@@ -1313,14 +1321,22 @@ def main():
         print(f"ERR|no monitor for {target} (found: {names})")
         return 0
 
+    try:
+        response_ms = f"{float(match['response']):.0f}"
+    except (TypeError, ValueError):
+        response_ms = match["response"] or "n/a"
+
     print("OK|{}|{}|{}|{}|{}".format(
         match["name"], "up" if match["up"] else "DOWN",
-        match["ratio"] or "n/a", match["response"] or "n/a",
-        len(match["events"])))
+        match["ratio"] or "n/a", response_ms, len(match["events"])))
 
     for event in match["events"][:5]:
-        print("EVENT|{}|{}".format(
-            event.get("datetime", ""), event.get("duration", "")))
+        stamp = event.get("datetime", "")
+        try:
+            stamp = datetime.fromtimestamp(int(stamp)).strftime("%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            pass
+        print("EVENT|{}|{}".format(stamp, event.get("duration", "")))
     return 0
 
 
@@ -1348,7 +1364,7 @@ _uptime_check() {
         return 1
     }
 
-    local api_version="" got_data=false
+    local api_version="" got_data=false degraded=false
     while IFS='|' read -r kind a b c d e; do
         case "${kind}" in
             API)
@@ -1370,7 +1386,7 @@ _uptime_check() {
                 if [[ "${c}" =~ ^[0-9.]+$ ]]; then
                     local scaled; scaled=$(printf '%.0f' "$(echo "${c} 100" | awk '{print $1*$2}')")
                     if   (( scaled < 9900 )); then status=1
-                    elif (( scaled < 9990 )); then warn "  Uptime under 99.9% this week."
+                    elif (( scaled < 9990 )); then degraded=true
                     fi
                 fi
                 ;;
@@ -1387,10 +1403,12 @@ _uptime_check() {
         warn "  Uptime unknown — no monitor data."
         return 0
     fi
-    if [[ ${status} -eq 0 ]]; then
-        ok "  Uptime healthy."
-    else
+    if [[ ${status} -ne 0 ]]; then
         err "  Uptime needs attention."
+    elif [[ "${degraded}" == true ]]; then
+        warn "  Uptime under 99.9% this week — degraded, not down."
+    else
+        ok "  Uptime healthy."
     fi
     return ${status}
 }
