@@ -1108,6 +1108,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
@@ -1266,8 +1267,17 @@ RESPONSE_SCHEMA = {
 MODEL_CANDIDATES = [
     "gemini-flash-latest",
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash",
+    "gemini-flash-lite-latest",
 ]
+
+
+def api_message(body):
+    """Best-effort human-readable message out of a Gemini error body."""
+    try:
+        return json.loads(body)["error"]["message"]
+    except (ValueError, KeyError, TypeError):
+        return " ".join(body.split())
 
 
 def gemini_request(url, payload=None, timeout=90):
@@ -1279,11 +1289,14 @@ def gemini_request(url, payload=None, timeout=90):
         return json.load(response)
 
 
-def pick_model(api_key):
-    """Resolve a usable model name, preferring a configured or flash model."""
+SKIP_MODEL = re.compile(r"tts|image|audio|video|embedding|vision|live|omni|native", re.I)
+
+
+def pick_models(api_key):
+    """Ordered list of models to try — flash first, preview variants last."""
     configured = os.environ.get("MSSH_GEMINI_MODEL", "").strip()
     if configured:
-        return configured
+        return [configured]
 
     listing = gemini_request(
         f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}&pageSize=200",
@@ -1291,21 +1304,26 @@ def pick_model(api_key):
     available = [
         model["name"].split("/")[-1] for model in listing.get("models", [])
         if "generateContent" in model.get("supportedGenerationMethods", [])
+        and not SKIP_MODEL.search(model["name"])
     ]
-    for candidate in MODEL_CANDIDATES:
-        if candidate in available:
-            return candidate
-    for name in available:
-        if "flash" in name and "thinking" not in name:
-            return name
-    if not available:
-        raise RuntimeError("no Gemini model supports generateContent for this key")
-    return available[0]
+
+    ordered = [name for name in MODEL_CANDIDATES if name in available]
+    extra = sorted(
+        (name for name in available
+         if name not in ordered and "flash" in name and "preview" not in name),
+        reverse=True)
+    ordered += extra
+    if not ordered:
+        raise RuntimeError("no usable Gemini model for this key")
+    return ordered[:4]
 
 
 def classify_with_gemini(pending, api_key):
-    """Ask Gemini to prioritize the signatures it has not seen before."""
-    model = pick_model(api_key)
+    """Ask Gemini to prioritize the signatures it has not seen before.
+
+    Overloaded models answer 503 and rate limits answer 429; both are worth
+    one retry before moving on to the next candidate model.
+    """
     payload = {
         "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": json.dumps([
@@ -1317,11 +1335,35 @@ def classify_with_gemini(pending, api_key):
             "responseMimeType": "application/json",
             "responseSchema": RESPONSE_SCHEMA,
             "temperature": 0,
+            "maxOutputTokens": 8192,
         },
     }
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{model}:generateContent?key={api_key}")
-    response = gemini_request(url, payload)
+    models = pick_models(api_key)
+    last_error = None
+    response = model = None
+
+    for candidate in models:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{candidate}:generateContent?key={api_key}")
+        for attempt in range(3):
+            try:
+                response = gemini_request(url, payload)
+                model = candidate
+                break
+            except urllib.error.HTTPError as error:
+                detail = api_message(error.read().decode("utf-8", "replace"))
+                last_error = f"{candidate}: HTTP {error.code} {detail[:90]}"
+                # 429/503 are load, not a bad request — back off, then try the
+                # next model rather than giving up on the whole report.
+                if error.code in (429, 500, 503) and attempt < 2:
+                    time.sleep(2 + attempt * 3)
+                    continue
+                break
+        if response is not None:
+            break
+
+    if response is None:
+        raise RuntimeError(last_error or "no Gemini response")
 
     text = "".join(
         part.get("text", "")
