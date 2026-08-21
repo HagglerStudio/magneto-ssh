@@ -17,6 +17,7 @@ Pure Bash — no Python, no pip, no venv.
 | `filezilla` | `filezilla` command — SFTP file manager | `sudo apt install filezilla` |
 | `dbeaver` or `dbeaver-ce` | `dbeaver` command — database GUI | [dbeaver.io](https://dbeaver.io/download/) |
 | `lsof` | Tunnel port management | Pre-installed |
+| `openpyxl` | `report` command — xlsx output | `pip install --user openpyxl` |
 
 Minimum required for core commands (`add`, `ssh`, `list`, etc.): **ssh + sshpass**.
 
@@ -201,6 +202,7 @@ One SSH round-trip, three checks:
    erroring at 90%.
 
 Exits with status `1` when any check fails, so it can be used in scripts.
+Add `--report` to also build the xlsx exception report described below.
 
 | Option | Description |
 |--------|-------------|
@@ -209,6 +211,42 @@ Exits with status `1` when any check fails, so it can be used in scripts.
 | `--output DIR` | Directory for the downloaded log (default `~/.magneto-ssh/reports/<name>`) |
 | `--log PATH` | Override the log path |
 | `--disk PATH` | Override the `df -h` path for this run |
+| `--report` | Also generate the xlsx exception report |
+
+### Exception log report
+
+```bash
+magneto-ssh report myproject_stage
+# or analyse a log you already have
+magneto-ssh report --file ~/Downloads/exception.log --open
+```
+
+Downloads `exception.log`, groups the entries by normalized signature, counts
+occurrences, assigns each signature a priority, and writes an xlsx with a
+summary sheet (issues, occurrences and share per priority) and a detail sheet
+(count, priority, message, level, first/last seen, reason).
+
+Priorities are `P1 Critical`, `P2 High`, `P3 Medium`, `P4 Low`, assigned by
+customer impact rather than by log level — a `WARNING` that breaks checkout
+outranks an `ERROR` from a mistyped password.
+
+| Option | Description |
+|--------|-------------|
+| `--file PATH` | Analyse a local log instead of downloading one |
+| `--output FILE` | Where to write the xlsx (default `~/.magneto-ssh/reports/<name>/`) |
+| `--days N` | Only include entries from the last N days |
+| `--top N` | Keep only the N most frequent issues |
+| `--rules` | Skip Gemini and prioritize by log level only |
+| `--open` | Open the finished xlsx |
+
+**Classification.** Set `GEMINI_API_KEY` (free key from
+[aistudio.google.com/apikey](https://aistudio.google.com/apikey)) and only the
+signatures that have never been seen are sent to Gemini — never the raw log.
+Verdicts are cached in `~/.magneto-ssh/priority-map.json`, so recurring errors
+cost nothing on later runs. Without a key, or with `--rules`, priorities come
+from the log level alone and no network call is made.
+
+Requires `python3` with `openpyxl` (`pip install --user openpyxl`).
 
 ---
 
@@ -221,7 +259,7 @@ magneto-ssh install-completion
 source ~/.bash_completion.d/magneto-ssh
 ```
 
-Tab-completing server names works for: `ssh`, `scp`, `info`, `edit`, `remove`, `filezilla`, `tunnel`, `dbeaver`, `housekeeping`
+Tab-completing server names works for: `ssh`, `scp`, `info`, `edit`, `remove`, `filezilla`, `tunnel`, `dbeaver`, `housekeeping`, `report`
 
 ```bash
 magneto-ssh ssh myp<TAB>
@@ -304,6 +342,7 @@ curl -fsSL https://raw.githubusercontent.com/JainamDeveloper/magneto-ssh/main/in
 | `tunnel <name>` | | Create SSH tunnel to remote DB |
 | `dbeaver <name>` | `db` | Open tunnel + launch DBeaver |
 | `housekeeping <name>` | `hk` | Indexer status + disk usage + download exception.log |
+| `report <name>` | | Prioritized exception.log report as xlsx |
 | `install-completion` | | Install bash tab completion |
 | `upgrade` | | Self-upgrade to latest version |
 | `version` | `--version` | Print version |

@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION="1.4.000"
+VERSION="1.5.000"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 CONFIG_DIR="${HOME}/.magneto-ssh"
@@ -894,6 +894,7 @@ _hk_rquote() {
 
 cmd_housekeeping() {
     local name="" tail_lines=20 download=true out_dir="" log_path="" disk_path_override=""
+    local make_report=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -902,11 +903,13 @@ cmd_housekeeping() {
             --output|-o)     out_dir="${2:-}"; shift 2 ;;
             --log)           log_path="${2:-}"; shift 2 ;;
             --disk)          disk_path_override="${2:-}"; shift 2 ;;
+            --report)        make_report=true; shift ;;
+            --rules)         REPORT_CLASSIFIER="rules"; shift ;;
             *)               [[ -z "${name}" ]] && name="$1"; shift ;;
         esac
     done
 
-    [[ -n "${name}" ]] || die "Usage: magneto-ssh housekeeping <name> [--tail N] [--no-download] [--output DIR] [--log PATH] [--disk PATH]"
+    [[ -n "${name}" ]] || die "Usage: magneto-ssh housekeeping <name> [--tail N] [--no-download] [--report] [--output DIR] [--log PATH] [--disk PATH]"
     server_exists "${name}" || die "Server '${name}' not found. Run: magneto-ssh list"
 
     local file; file=$(server_file "${name}")
@@ -1057,6 +1060,11 @@ REMOTE
             printf '\n'
             if _scp_fetch "${name}" "$(_hk_rquote "${log_path}")" "${dest}"; then
                 ok "  Downloaded → ${CYAN}${dest}${NC}"
+                if [[ "${make_report}" == true ]]; then
+                    printf "\n${BOLD}4) Exception report${NC}\n"
+                    _run_report "${dest}" "${name}" \
+                        "${dest%.log}.xlsx" || exit_status=1
+                fi
             else
                 err "  Download failed: ${log_path}"
                 exit_status=1
@@ -1071,6 +1079,608 @@ REMOTE
         warn "Housekeeping found issues on ${CYAN}${name}${NC}.\n"
     fi
     return ${exit_status}
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Exception log report (xlsx) ──────────────────────────────────────────────
+
+# Embedded analyser: parses a Magento exception.log, groups it by signature,
+# assigns P1-P4 priorities (Gemini, with a cached/log-level fallback) and
+# writes an xlsx report. Configured entirely through MSSH_* env vars.
+_report_analyzer() {
+    python3 - <<'PYEOF'
+#!/usr/bin/env python3
+"""Turn a Magento exception.log into a prioritized xlsx report.
+
+Reads configuration from the environment:
+    MSSH_LOG     path to the exception.log to analyse (required)
+    MSSH_OUT     path of the xlsx to write (required)
+    MSSH_LABEL   report subtitle, normally the server name (required)
+    MSSH_CACHE   path of the signature -> priority JSON cache
+    MSSH_TOP     max rows in the detail sheet (0 = all)
+    MSSH_DAYS    only include entries from the last N days (0 = all)
+    MSSH_CLASSIFIER  rules | gemini
+    GEMINI_API_KEY, MSSH_GEMINI_MODEL
+"""
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from collections import OrderedDict
+from datetime import datetime, timedelta
+
+# ── Log parsing ──────────────────────────────────────────────────────────────
+
+ENTRY_RE = re.compile(
+    r"^\[(?P<ts>[^\]]+)\]\s+"
+    r"(?P<channel>[A-Za-z0-9_.\-]+)\."
+    r"(?P<level>EMERGENCY|ALERT|CRITICAL|ERROR|WARNING|NOTICE|INFO|DEBUG)"
+    r":\s*(?P<msg>.*)$"
+)
+
+# Applied in order to collapse one message into a signature.
+NORMALIZERS = [
+    (re.compile(r"\{\"exception\".*$", re.S), ""),            # trailing monolog context
+    (re.compile(r"\s*\[\]\s*$"), ""),                          # empty extra
+    (re.compile(r"\s*\{[^{}]*\}\s*$"), ""),                    # trailing context object
+    (re.compile(r"[a-f0-9]{32,}", re.I), "{HASH}"),
+    (re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b"), "{EMAIL}"),
+    (re.compile(r"(/[\w.\-]+){3,}"), "{PATH}"),
+    (re.compile(r"\b\d{1,3}(\.\d{1,3}){3}\b"), "{IP}"),
+    (re.compile(r"\b\d+\b"), "{N}"),
+    (re.compile(r"\s+"), " "),
+]
+
+LEVEL_FALLBACK = {
+    "EMERGENCY": "P1", "ALERT": "P1", "CRITICAL": "P1",
+    "ERROR": "P2",
+    "WARNING": "P3", "NOTICE": "P3",
+    "INFO": "P4", "DEBUG": "P4",
+}
+
+PRIORITY_ORDER = ["P1", "P2", "P3", "P4"]
+PRIORITY_NAME = {"P1": "Critical", "P2": "High", "P3": "Medium", "P4": "Low"}
+
+
+def parse_timestamp(raw):
+    raw = raw.strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=None)
+        except ValueError:
+            continue
+    return None
+
+
+CONTEXT_RE = [
+    re.compile(r"\s*\{\"exception\".*$", re.S),
+    re.compile(r"\s*\[\]\s*$"),
+    re.compile(r"\s*\{[^{}]*\}\s*$"),
+]
+
+
+def strip_context(message):
+    """Drop monolog's trailing context so the message reads cleanly."""
+    text = message
+    for pattern in CONTEXT_RE:
+        text = pattern.sub("", text)
+    return text.strip() or message.strip()
+
+
+def normalize(message):
+    text = message
+    for pattern, replacement in NORMALIZERS:
+        text = pattern.sub(replacement, text)
+    return text.strip(" \t.;:")
+
+
+def parse_log(path, days=0):
+    """Group log entries by normalized signature."""
+    cutoff = datetime.now() - timedelta(days=days) if days else None
+    groups = OrderedDict()
+    parsed = skipped = 0
+
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            match = ENTRY_RE.match(line)
+            if not match:
+                skipped += 1          # stack-trace continuation lines
+                continue
+
+            stamp = parse_timestamp(match.group("ts"))
+            if cutoff and stamp and stamp < cutoff:
+                continue
+
+            message = match.group("msg").strip()
+            signature = normalize(message)
+            if not signature:
+                continue
+            parsed += 1
+
+            key = hashlib.sha1(signature.encode()).hexdigest()[:16]
+            group = groups.get(key)
+            if group is None:
+                groups[key] = group = {
+                    "key": key,
+                    "signature": signature[:400],
+                    "sample": strip_context(message),
+                    "level": match.group("level"),
+                    "channel": match.group("channel"),
+                    "count": 0,
+                    "first": stamp,
+                    "last": stamp,
+                }
+            group["count"] += 1
+            if stamp:
+                if group["first"] is None or stamp < group["first"]:
+                    group["first"] = stamp
+                if group["last"] is None or stamp > group["last"]:
+                    group["last"] = stamp
+            # Keep the most severe level seen for this signature.
+            if PRIORITY_ORDER.index(LEVEL_FALLBACK[match.group("level")]) < \
+               PRIORITY_ORDER.index(LEVEL_FALLBACK[group["level"]]):
+                group["level"] = match.group("level")
+
+    return list(groups.values()), parsed, skipped
+
+
+# ── Classification ───────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You triage Magento 2 exception.log signatures for a support team.
+
+Assign each signature a priority by CUSTOMER and REVENUE impact, not by log level:
+  P1 Critical - checkout, payment, order placement or the whole site is broken
+  P2 High     - a customer-facing flow fails repeatedly: cart, login, search,
+                static content, integrations that block orders
+  P3 Medium   - recoverable or self-inflicted errors: wrong password, validation
+                messages, expired tokens, individual data issues
+  P4 Low      - noise, bots, out-of-range pagination, deprecations
+
+Also write a short reason (max 12 words) explaining the choice.
+Return one entry for every id you were given."""
+
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "priority": {"type": "string", "enum": PRIORITY_ORDER},
+                    "reason": {"type": "string"},
+                },
+                "required": ["id", "priority", "reason"],
+            },
+        }
+    },
+    "required": ["items"],
+}
+
+MODEL_CANDIDATES = [
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
+
+
+def gemini_request(url, payload=None, timeout=90):
+    data = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"},
+        method="POST" if data else "GET")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def pick_model(api_key):
+    """Resolve a usable model name, preferring a configured or flash model."""
+    configured = os.environ.get("MSSH_GEMINI_MODEL", "").strip()
+    if configured:
+        return configured
+
+    listing = gemini_request(
+        f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}&pageSize=200",
+        timeout=30)
+    available = [
+        model["name"].split("/")[-1] for model in listing.get("models", [])
+        if "generateContent" in model.get("supportedGenerationMethods", [])
+    ]
+    for candidate in MODEL_CANDIDATES:
+        if candidate in available:
+            return candidate
+    for name in available:
+        if "flash" in name and "thinking" not in name:
+            return name
+    if not available:
+        raise RuntimeError("no Gemini model supports generateContent for this key")
+    return available[0]
+
+
+def classify_with_gemini(pending, api_key):
+    """Ask Gemini to prioritize the signatures it has not seen before."""
+    model = pick_model(api_key)
+    payload = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": json.dumps([
+            {"id": index, "level": group["level"], "count": group["count"],
+             "message": group["signature"][:300]}
+            for index, group in enumerate(pending)
+        ], ensure_ascii=False)}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": RESPONSE_SCHEMA,
+            "temperature": 0,
+        },
+    }
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent?key={api_key}")
+    response = gemini_request(url, payload)
+
+    text = "".join(
+        part.get("text", "")
+        for part in response["candidates"][0]["content"]["parts"]
+    )
+    verdicts = {}
+    for item in json.loads(text).get("items", []):
+        index = item.get("id")
+        if isinstance(index, int) and 0 <= index < len(pending):
+            priority = item.get("priority")
+            if priority in PRIORITY_ORDER:
+                verdicts[index] = (priority, item.get("reason", "")[:120])
+    return verdicts, model
+
+
+def classify(groups, cache_path, classifier):
+    """Fill in priority/reason for every group. Returns (source, model, note)."""
+    cache = {}
+    if cache_path and os.path.exists(cache_path):
+        try:
+            with open(cache_path) as handle:
+                cache = json.load(handle)
+        except (ValueError, OSError):
+            cache = {}
+
+    pending = []
+    for group in groups:
+        cached = cache.get(group["key"])
+        if cached:
+            group["priority"] = cached["priority"]
+            group["reason"] = cached.get("reason", "")
+            group["source"] = "cache"
+        else:
+            group["priority"] = LEVEL_FALLBACK[group["level"]]
+            group["reason"] = ""
+            group["source"] = "rules"
+            pending.append(group)
+
+    model = ""
+    note = ""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+    if classifier == "gemini" and pending:
+        if not api_key:
+            note = "GEMINI_API_KEY not set — fell back to log-level priorities"
+        else:
+            try:
+                verdicts, model = classify_with_gemini(pending, api_key)
+                for index, (priority, reason) in verdicts.items():
+                    group = pending[index]
+                    group["priority"] = priority
+                    group["reason"] = reason
+                    group["source"] = "gemini"
+                    cache[group["key"]] = {
+                        "priority": priority,
+                        "reason": reason,
+                        "signature": group["signature"][:200],
+                    }
+                if cache_path:
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                    with open(cache_path, "w") as handle:
+                        json.dump(cache, handle, indent=1, sort_keys=True)
+            except urllib.error.HTTPError as error:
+                body = error.read().decode("utf-8", "replace")
+                try:
+                    detail = json.loads(body)["error"]["message"]
+                except (ValueError, KeyError, TypeError):
+                    detail = " ".join(body.split())
+                note = f"Gemini HTTP {error.code} — used log-level priorities: {detail[:90]}"
+            except Exception as error:                       # noqa: BLE001
+                note = f"Gemini call failed — used log-level priorities ({error})"
+
+    source = "gemini" if any(g["source"] == "gemini" for g in groups) else "rules"
+    if any(g["source"] == "cache" for g in groups) and source == "rules":
+        source = "cache"
+    return source, model, note
+
+
+# ── Spreadsheet ──────────────────────────────────────────────────────────────
+
+HEADER_FILL = "1F4E79"
+PRIORITY_FILL = {"P1": "F8CBAD", "P2": "FCE4D6", "P3": "FFF2CC", "P4": "E2EFDA"}
+BAND_FILL = "F2F7FB"
+
+
+def write_xlsx(path, label, groups, totals, meta):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_font = Font(bold=True, color="FFFFFF", size=10)
+    head_fill = PatternFill("solid", fgColor=HEADER_FILL)
+
+    workbook = Workbook()
+
+    # ── Summary sheet ────────────────────────────────────────────────────────
+    sheet = workbook.active
+    sheet.title = "Summary"
+    sheet["A1"] = "Exception Log Summary"
+    sheet["A1"].font = Font(bold=True, size=18, color=HEADER_FILL)
+    sheet.merge_cells("A1:D1")
+    sheet["A1"].alignment = Alignment(horizontal="center")
+
+    sheet["A2"] = label
+    sheet["A2"].font = Font(size=12)
+    sheet.merge_cells("A2:D2")
+    sheet["A2"].alignment = Alignment(horizontal="center")
+
+    period = "n/a"
+    if meta["first"] and meta["last"]:
+        period = f"{meta['first']:%Y-%m-%d} to {meta['last']:%Y-%m-%d}"
+    sheet["A3"] = (f"Period: {period}  |  Generated: {meta['generated']:%Y-%m-%d %H:%M}"
+                   f"  |  Unique issues: {len(groups)}  |  Total occurrences: {totals['all']}")
+    sheet.merge_cells("A3:D3")
+    sheet["A3"].alignment = Alignment(horizontal="center")
+
+    row = 5
+    for column, title in enumerate(
+            ["Priority", "Unique Issues", "Occurrences", "% of Total"], start=1):
+        cell = sheet.cell(row=row, column=column, value=title)
+        cell.font, cell.fill, cell.border = head_font, head_fill, border
+        cell.alignment = Alignment(horizontal="center")
+
+    for priority in PRIORITY_ORDER:
+        bucket = totals["by_priority"].get(priority)
+        if not bucket:
+            continue
+        row += 1
+        share = bucket["count"] / totals["all"] * 100 if totals["all"] else 0
+        values = [f"{priority} {PRIORITY_NAME[priority]}", bucket["unique"],
+                  bucket["count"], round(share, 1)]
+        for column, value in enumerate(values, start=1):
+            cell = sheet.cell(row=row, column=column, value=value)
+            cell.border = border
+            cell.alignment = Alignment(
+                horizontal="left" if column == 1 else "center")
+            if column == 1:
+                cell.fill = PatternFill("solid", fgColor=PRIORITY_FILL[priority])
+            if column == 4:
+                cell.number_format = '0.0"%"'
+
+    row += 2
+    sheet.cell(row=row, column=1, value="Legend:").font = Font(bold=True)
+    sheet.cell(row=row, column=2,
+               value="P1 Critical | P2 High | P3 Medium | P4 Low")
+    row += 1
+    sheet.cell(row=row, column=1, value="Priorities by:").font = Font(bold=True)
+    sheet.cell(row=row, column=2, value=meta["source_label"])
+    if meta["note"]:
+        row += 1
+        cell = sheet.cell(row=row, column=1, value=meta["note"])
+        cell.font = Font(italic=True, color="C00000")
+
+    for column, width in enumerate([26, 16, 16, 14], start=1):
+        sheet.column_dimensions[get_column_letter(column)].width = width
+
+    # ── Detail sheet ─────────────────────────────────────────────────────────
+    detail = workbook.create_sheet("Errors")
+    headers = ["#", "Count", "Pri", "Error", "Level",
+               "First seen", "Last seen", "Why this priority"]
+    for column, title in enumerate(headers, start=1):
+        cell = detail.cell(row=1, column=column, value=title)
+        cell.font, cell.fill, cell.border = head_font, head_fill, border
+        cell.alignment = Alignment(horizontal="center")
+
+    for index, group in enumerate(groups, start=1):
+        row = index + 1
+        values = [
+            index,
+            group["count"],
+            group["priority"],
+            group["sample"][:400],
+            group["level"],
+            f"{group['first']:%Y-%m-%d %H:%M}" if group["first"] else "",
+            f"{group['last']:%Y-%m-%d %H:%M}" if group["last"] else "",
+            group["reason"],
+        ]
+        for column, value in enumerate(values, start=1):
+            cell = detail.cell(row=row, column=column, value=value)
+            cell.border = border
+            if column == 3:
+                cell.fill = PatternFill(
+                    "solid", fgColor=PRIORITY_FILL[group["priority"]])
+                cell.alignment = Alignment(horizontal="center")
+            elif column in (1, 2, 5):
+                cell.alignment = Alignment(horizontal="center")
+            else:
+                cell.alignment = Alignment(vertical="top", wrap_text=(column == 4))
+            if column != 3 and index % 2 == 0:
+                cell.fill = PatternFill("solid", fgColor=BAND_FILL)
+
+    for column, width in enumerate([5, 8, 6, 78, 10, 17, 17, 40], start=1):
+        detail.column_dimensions[get_column_letter(column)].width = width
+    detail.freeze_panes = "A2"
+    detail.auto_filter.ref = f"A1:H{len(groups) + 1}"
+
+    workbook.save(path)
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+def main():
+    log_path = os.environ["MSSH_LOG"]
+    out_path = os.environ["MSSH_OUT"]
+    label = os.environ.get("MSSH_LABEL", "")
+    cache_path = os.environ.get("MSSH_CACHE", "")
+    classifier = os.environ.get("MSSH_CLASSIFIER", "gemini")
+    top = int(os.environ.get("MSSH_TOP", "0") or 0)
+    days = int(os.environ.get("MSSH_DAYS", "0") or 0)
+
+    groups, parsed, skipped = parse_log(log_path, days)
+    if not groups:
+        print("EMPTY", file=sys.stderr)
+        return 2
+
+    source, model, note = classify(groups, cache_path, classifier)
+
+    groups.sort(key=lambda g: (-g["count"], PRIORITY_ORDER.index(g["priority"])))
+    if top:
+        groups = groups[:top]
+
+    totals = {"all": sum(g["count"] for g in groups), "by_priority": {}}
+    for group in groups:
+        bucket = totals["by_priority"].setdefault(
+            group["priority"], {"unique": 0, "count": 0})
+        bucket["unique"] += 1
+        bucket["count"] += group["count"]
+
+    stamps = [g["first"] for g in groups if g["first"]] + \
+             [g["last"] for g in groups if g["last"]]
+    source_label = {
+        "gemini": f"Gemini ({model})" if model else "Gemini",
+        "cache": "cached Gemini verdicts",
+        "rules": "log level (no AI call)",
+    }[source]
+
+    write_xlsx(out_path, label, groups, totals, {
+        "first": min(stamps) if stamps else None,
+        "last": max(stamps) if stamps else None,
+        "generated": datetime.now(),
+        "source_label": source_label,
+        "note": note,
+    })
+
+    summary = " ".join(
+        f"{p}={totals['by_priority'][p]['count']}"
+        for p in PRIORITY_ORDER if p in totals["by_priority"])
+    print(f"OK|{len(groups)}|{totals['all']}|{parsed}|{skipped}|{source_label}|{summary}|{note}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+}
+
+# _run_report <log_file> <label> <out_file> — analyse a local log, print result.
+_run_report() {
+    local log_file="$1" label="$2" out_file="$3"
+
+    command -v python3 &>/dev/null || die "python3 is required for reports."
+    python3 -c "import openpyxl" 2>/dev/null \
+        || die "python3 openpyxl is required. Run: pip install --user openpyxl"
+
+    [[ -s "${log_file}" ]] || { warn "Log file is empty: ${log_file}"; return 1; }
+
+    mkdir -p "$(dirname "${out_file}")"
+
+    local result
+    if ! result=$(MSSH_LOG="${log_file}" \
+                  MSSH_OUT="${out_file}" \
+                  MSSH_LABEL="${label}" \
+                  MSSH_CACHE="${CONFIG_DIR}/priority-map.json" \
+                  MSSH_CLASSIFIER="${REPORT_CLASSIFIER:-gemini}" \
+                  MSSH_TOP="${REPORT_TOP:-0}" \
+                  MSSH_DAYS="${REPORT_DAYS:-0}" \
+                  _report_analyzer); then
+        err "Report generation failed."
+        return 1
+    fi
+
+    if [[ "${result}" != OK\|* ]]; then
+        warn "No parsable log entries found in ${log_file}."
+        return 1
+    fi
+
+    local unique total parsed skipped source summary note
+    IFS='|' read -r _ unique total parsed skipped source summary note <<< "${result}"
+
+    printf "\n  %-16s %s\n" "Unique issues"  "${unique}"
+    printf "  %-16s %s\n"   "Occurrences"    "${total}"
+    printf "  %-16s %s\n"   "Lines parsed"   "${parsed}"
+    printf "  %-16s %s\n"   "Priorities by"  "${source}"
+    printf "  %-16s %s\n"   "Breakdown"      "${summary}"
+    [[ -n "${note}" ]] && warn "  ${note}"
+    printf '\n'
+    ok "Report → ${CYAN}${out_file}${NC}"
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_report() {
+    local name="" log_file="" out_file="" remote_log=""
+    REPORT_CLASSIFIER="gemini"; REPORT_TOP=0; REPORT_DAYS=0
+    local open_after=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --file|-f)   log_file="${2:-}"; shift 2 ;;
+            --output|-o) out_file="${2:-}"; shift 2 ;;
+            --log)       remote_log="${2:-}"; shift 2 ;;
+            --rules)     REPORT_CLASSIFIER="rules"; shift ;;
+            --gemini)    REPORT_CLASSIFIER="gemini"; shift ;;
+            --days|-d)   REPORT_DAYS="${2:-0}"; shift 2 ;;
+            --top|-t)    REPORT_TOP="${2:-0}"; shift 2 ;;
+            --open)      open_after=true; shift ;;
+            *)           [[ -z "${name}" ]] && name="$1"; shift ;;
+        esac
+    done
+
+    local label="${name}"
+    local stamp; stamp=$(date '+%Y%m%d-%H%M%S')
+
+    if [[ -z "${log_file}" ]]; then
+        [[ -n "${name}" ]] \
+            || die "Usage: magneto-ssh report <name> [options]
+       magneto-ssh report --file <exception.log> [options]"
+        server_exists "${name}" || die "Server '${name}' not found. Run: magneto-ssh list"
+
+        local file; file=$(server_file "${name}")
+        local project_dir; project_dir=$(read_field "${file}" PROJECT_DIR)
+        [[ -n "${project_dir}" ]] \
+            || die "No PROJECT_DIR set for '${name}'. Run: magneto-ssh edit ${name}"
+        remote_log="${remote_log:-${project_dir%/}/var/log/exception.log}"
+
+        log_file="${CONFIG_DIR}/reports/${name}/exception-${stamp}.log"
+        mkdir -p "$(dirname "${log_file}")"
+
+        printf "\n${DIM}Downloading${NC} ${CYAN}%s:%s${NC}\n" "${name}" "${remote_log}"
+        _scp_fetch "${name}" "$(_hk_rquote "${remote_log}")" "${log_file}" \
+            || die "Could not download ${remote_log} from '${name}'."
+    else
+        [[ -f "${log_file}" ]] || die "Log file not found: ${log_file}"
+        label="${label:-$(basename "${log_file}")}"
+    fi
+
+    out_file="${out_file:-${CONFIG_DIR}/reports/${label// /_}/exception-report-${stamp}.xlsx}"
+
+    printf "\n${BOLD}${CYAN}Exception log report${NC} — ${BOLD}%s${NC}\n" "${label}"
+    _run_report "${log_file}" "${label}" "${out_file}" || return 1
+
+    if [[ "${open_after}" == true ]] && command -v xdg-open &>/dev/null; then
+        xdg-open "${out_file}" &>/dev/null &
+        disown
+    fi
+    printf '\n'
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1203,6 +1813,7 @@ ${BOLD}Commands:${NC}
   ${CYAN}tunnel${NC}   <name>          Create SSH tunnel to remote DB (localhost:TUNNEL_LOCAL_PORT)
   ${CYAN}dbeaver${NC}  <name>          Open tunnel + launch DBeaver with DB connection
   ${CYAN}housekeeping${NC} <name>     Indexer status + disk usage + download exception.log
+  ${CYAN}report${NC} <name>            Prioritized exception.log report as xlsx
   ${CYAN}version${NC}                  Print version and check for updates
   ${CYAN}update${NC}                   Update magneto-ssh to latest version
 
@@ -1224,6 +1835,19 @@ ${BOLD}housekeeping options:${NC}
   --output DIR      Where to save the log (default ~/.magneto-ssh/reports/<name>)
   --log PATH        Override exception.log path (default <PROJECT_DIR>/var/log/exception.log)
   --disk PATH       Override df -h path (default DISK_PATH, else ~/application/)
+  --report          Also build the xlsx exception report
+
+${BOLD}report options:${NC}
+  --file PATH       Analyse a local log instead of downloading one
+  --output FILE     Where to write the xlsx (default ~/.magneto-ssh/reports/<name>/)
+  --days N          Only include entries from the last N days
+  --top N           Keep only the N most frequent issues
+  --rules           Skip Gemini, prioritize by log level only
+  --open            Open the xlsx when it is done
+
+${BOLD}Gemini:${NC}  export GEMINI_API_KEY=...   (key from https://aistudio.google.com/apikey)
+  Priorities are cached in ~/.magneto-ssh/priority-map.json, so repeat errors
+  never hit the API again. Without a key the report falls back to log levels.
 
 ${BOLD}Name format:${NC}  project_environment
   e.g.  petzone_stage   petzone_production   clientA_dev
@@ -1241,7 +1865,7 @@ cmd_install_completion() {
 _magneto_ssh_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
     local prev="${COMP_WORDS[COMP_CWORD-1]}"
-    local cmds="add edit ssh scp download list info remove import validate filezilla tunnel dbeaver housekeeping hk install-completion version update help"
+    local cmds="add edit ssh scp download list info remove import validate filezilla tunnel dbeaver housekeeping hk report install-completion version update help"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
         # Complete both commands and server names
@@ -1254,7 +1878,7 @@ _magneto_ssh_complete() {
     fi
 
     case "${prev}" in
-        ssh|scp|download|info|remove|add|edit|update|filezilla|fz|tunnel|dbeaver|db|housekeeping|hk)
+        ssh|scp|download|info|remove|add|edit|update|filezilla|fz|tunnel|dbeaver|db|housekeeping|hk|report)
             local servers=""
             [[ -d "${HOME}/.magneto-ssh/servers" ]] \
                 && servers=$(ls "${HOME}/.magneto-ssh/servers" 2>/dev/null | tr '\n' ' ')
@@ -1408,6 +2032,7 @@ main() {
         tunnel)                 cmd_tunnel "$@" ;;
         dbeaver|db)             cmd_dbeaver "$@" ;;
         housekeeping|hk)        cmd_housekeeping "$@" ;;
+        report)                 cmd_report "$@" ;;
         validate|check)         cmd_validate "$@" ;;
         version|--version|-v)   cmd_version ;;
         upgrade|update|self-update) cmd_upgrade ;;
