@@ -894,7 +894,7 @@ _hk_rquote() {
 
 cmd_housekeeping() {
     local name="" tail_lines=20 download=true out_dir="" log_path="" disk_path_override=""
-    local make_report=false
+    local make_report=true
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -904,12 +904,13 @@ cmd_housekeeping() {
             --log)           log_path="${2:-}"; shift 2 ;;
             --disk)          disk_path_override="${2:-}"; shift 2 ;;
             --report)        make_report=true; shift ;;
+            --no-report)     make_report=false; shift ;;
             --rules)         REPORT_CLASSIFIER="rules"; shift ;;
             *)               [[ -z "${name}" ]] && name="$1"; shift ;;
         esac
     done
 
-    [[ -n "${name}" ]] || die "Usage: magneto-ssh housekeeping <name> [--tail N] [--no-download] [--report] [--output DIR] [--log PATH] [--disk PATH]"
+    [[ -n "${name}" ]] || die "Usage: magneto-ssh housekeeping <name> [--tail N] [--no-download] [--no-report] [--output DIR] [--log PATH] [--disk PATH]"
     server_exists "${name}" || die "Server '${name}' not found. Run: magneto-ssh list"
 
     local file; file=$(server_file "${name}")
@@ -1854,7 +1855,7 @@ ${BOLD}Commands:${NC}
   ${CYAN}filezilla${NC} <name>         Open server in FileZilla (SFTP)
   ${CYAN}tunnel${NC}   <name>          Create SSH tunnel to remote DB (localhost:TUNNEL_LOCAL_PORT)
   ${CYAN}dbeaver${NC}  <name>          Open tunnel + launch DBeaver with DB connection
-  ${CYAN}housekeeping${NC} <name>     Indexer status + disk usage + download exception.log
+  ${CYAN}housekeeping${NC} <name>     Indexer status + disk usage + exception.log report
   ${CYAN}report${NC} <name>            Prioritized exception.log report as xlsx
   ${CYAN}version${NC}                  Print version and check for updates
   ${CYAN}update${NC}                   Update magneto-ssh to latest version
@@ -1877,7 +1878,7 @@ ${BOLD}housekeeping options:${NC}
   --output DIR      Where to save the log (default ~/.magneto-ssh/reports/<name>)
   --log PATH        Override exception.log path (default <PROJECT_DIR>/var/log/exception.log)
   --disk PATH       Override df -h path (default DISK_PATH, else ~/application/)
-  --report          Also build the xlsx exception report
+  --no-report       Skip the xlsx exception report (built by default)
 
 ${BOLD}report options:${NC}
   --file PATH       Analyse a local log instead of downloading one

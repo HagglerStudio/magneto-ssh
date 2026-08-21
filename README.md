@@ -191,7 +191,7 @@ magneto-ssh housekeeping myproject_stage
 magneto-ssh hk myproject_stage
 ```
 
-One SSH round-trip, three checks:
+One SSH round-trip, three checks plus a report:
 
 1. **exception.log** — reads `<PROJECT_DIR>/var/log/exception.log`, reports size, line count and
    last-modified time, prints the last lines, and downloads a timestamped copy to
@@ -200,9 +200,10 @@ One SSH round-trip, three checks:
    and flags any indexer that is not Ready.
 3. **Disk usage** — runs `df -h` on `DISK_PATH` (default `~/application/`), warning at 80% used and
    erroring at 90%.
+4. **Exception report** — builds the prioritized xlsx described below from the log it just
+   downloaded. Skip it with `--no-report`.
 
 Exits with status `1` when any check fails, so it can be used in scripts.
-Add `--report` to also build the xlsx exception report described below.
 
 | Option | Description |
 |--------|-------------|
@@ -211,7 +212,7 @@ Add `--report` to also build the xlsx exception report described below.
 | `--output DIR` | Directory for the downloaded log (default `~/.magneto-ssh/reports/<name>`) |
 | `--log PATH` | Override the log path |
 | `--disk PATH` | Override the `df -h` path for this run |
-| `--report` | Also generate the xlsx exception report |
+| `--no-report` | Skip the xlsx exception report |
 
 ### Exception log report
 
