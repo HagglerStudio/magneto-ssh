@@ -192,7 +192,7 @@ magneto-ssh housekeeping myproject_stage
 magneto-ssh hk myproject_stage
 ```
 
-One SSH round-trip, four checks plus a report:
+One SSH round-trip, five checks plus a report:
 
 1. **exception.log** — reads `<PROJECT_DIR>/var/log/exception.log`, reports size, line count and
    last-modified time, prints the last lines, and downloads a timestamped copy to
@@ -204,7 +204,11 @@ One SSH round-trip, four checks plus a report:
 4. **SSL certificate** — connects to the host in `FRONTEND_URL` on port 443 and reads the
    certificate: issuer, issue and expiry dates, days remaining. Warns under 30 days, errors under
    7 days or when expired. Runs locally, not over SSH.
-5. **Exception report** — builds the prioritized xlsx described below from the log it just
+5. **PageSpeed** — runs Lighthouse against `FRONTEND_URL` on mobile and desktop, printing
+   performance, accessibility, best-practices and SEO scores plus LCP/CLS/INP field data. Each run
+   is appended to `~/.magneto-ssh/reports/<name>/pagespeed.md` so trends stay visible. Takes about
+   a minute; skip it with `--no-pagespeed`.
+6. **Exception report** — builds the prioritized xlsx described below from the log it just
    downloaded. Skip it with `--no-report`.
 
 Exits with status `1` when any check fails, so it can be used in scripts.
@@ -219,6 +223,8 @@ Exits with status `1` when any check fails, so it can be used in scripts.
 | `--no-report` | Skip the xlsx exception report |
 | `--no-ssl` | Skip the SSL certificate check |
 | `--domain HOST` | Check this host's certificate instead of `FRONTEND_URL`'s |
+| `--no-pagespeed` | Skip the PageSpeed Insights run |
+| `--url URL` | Measure this URL instead of `FRONTEND_URL` |
 
 ### Exception log report
 
@@ -245,6 +251,10 @@ outranks an `ERROR` from a mistyped password.
 | `--top N` | Keep only the N most frequent issues |
 | `--rules` | Skip Gemini and prioritize by log level only |
 | `--open` | Open the finished xlsx |
+
+**PageSpeed key.** Set `PAGESPEED_API_KEY`, or put it in `~/.magneto-ssh/.env` as
+`PAGESPEED_API_KEY=...`. The API also answers without a key, but Google throttles the anonymous
+quota quickly once the check runs regularly.
 
 **Classification.** Set `GEMINI_API_KEY` (free key from
 [aistudio.google.com/apikey](https://aistudio.google.com/apikey)) and only the

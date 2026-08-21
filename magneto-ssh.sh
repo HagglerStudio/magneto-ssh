@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION="1.6.000"
+VERSION="1.7.000"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 CONFIG_DIR="${HOME}/.magneto-ssh"
@@ -940,6 +940,7 @@ _ssl_check() {
 cmd_housekeeping() {
     local name="" tail_lines=20 download=true out_dir="" log_path="" disk_path_override=""
     local make_report=true check_ssl=true domain_override=""
+    local check_speed=true url_override=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -952,12 +953,15 @@ cmd_housekeeping() {
             --no-report)     make_report=false; shift ;;
             --no-ssl)        check_ssl=false; shift ;;
             --domain)        domain_override="${2:-}"; shift 2 ;;
+            --no-pagespeed)  check_speed=false; shift ;;
+            --url)           url_override="${2:-}"; shift 2 ;;
             --rules)         REPORT_CLASSIFIER="rules"; shift ;;
             *)               [[ -z "${name}" ]] && name="$1"; shift ;;
         esac
     done
 
-    [[ -n "${name}" ]] || die "Usage: magneto-ssh housekeeping <name> [--tail N] [--no-download] [--no-report] [--no-ssl] [--output DIR] [--log PATH] [--disk PATH] [--domain HOST]"
+    [[ -n "${name}" ]] || die "Usage: magneto-ssh housekeeping <name> [--tail N] [--no-download] [--no-report] [--no-ssl] [--no-pagespeed]
+       [--output DIR] [--log PATH] [--disk PATH] [--domain HOST] [--url URL]"
     server_exists "${name}" || die "Server '${name}' not found. Run: magneto-ssh list"
 
     local file; file=$(server_file "${name}")
@@ -1141,9 +1145,25 @@ REMOTE
         printf '\n'
     fi
 
-    # ── 5. Exception report ──────────────────────────────────────────────────
+    # ── 5. PageSpeed ─────────────────────────────────────────────────────────
+    if [[ "${check_speed}" == true ]]; then
+        local speed_url="${url_override}"
+        [[ -z "${speed_url}" ]] && speed_url=$(read_field "${file}" FRONTEND_URL)
+
+        printf "${BOLD}5) PageSpeed (mobile + desktop)${NC}\n"
+        if [[ -z "${speed_url}" ]]; then
+            warn "  No FRONTEND_URL set — skipped. Run: magneto-ssh edit ${name}"
+        else
+            [[ "${speed_url}" == http*://* ]] || speed_url="https://${speed_url}"
+            _pagespeed_check "${speed_url}" \
+                "${CONFIG_DIR}/reports/${name}/pagespeed.md" || exit_status=1
+        fi
+        printf '\n'
+    fi
+
+    # ── 6. Exception report ──────────────────────────────────────────────────
     if [[ "${make_report}" == true && -n "${downloaded_log}" ]]; then
-        printf "${BOLD}5) Exception report${NC}\n"
+        printf "${BOLD}6) Exception report${NC}\n"
         _run_report "${downloaded_log}" "${name}" \
             "${downloaded_log%.log}.xlsx" || exit_status=1
         printf '\n'
@@ -1155,6 +1175,170 @@ REMOTE
         warn "Housekeeping found issues on ${CYAN}${name}${NC}.\n"
     fi
     return ${exit_status}
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── PageSpeed Insights ───────────────────────────────────────────────────────
+
+# Runs Lighthouse for one URL on both strategies and prints a table. Also
+# appends the run to a per-server markdown history so trends stay visible.
+_pagespeed_fetch() {
+    python3 - <<'PYEOF'
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API_URL = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+CATEGORIES = ["performance", "accessibility", "best-practices", "seo"]
+SCORE_KEYS = ["performance", "accessibility", "best-practices", "seo"]
+
+
+def fetch(url, strategy, api_key):
+    params = {"url": url, "strategy": strategy, "category": CATEGORIES}
+    if api_key:
+        params["key"] = api_key
+    query = urllib.parse.urlencode(params, doseq=True)
+    with urllib.request.urlopen(f"{API_URL}?{query}", timeout=180) as response:
+        return json.load(response)
+
+
+def scores(data):
+    categories = data["lighthouseResult"]["categories"]
+    return {
+        key: round(categories[key]["score"] * 100)
+        for key in SCORE_KEYS
+        if categories.get(key) and categories[key].get("score") is not None
+    }
+
+
+def vitals(data):
+    """Field data from CrUX — absent for low-traffic sites, hence the n/a."""
+    metrics = data.get("loadingExperience", {}).get("metrics", {})
+
+    def value(key, divisor=1, unit="", decimals=1):
+        metric = metrics.get(key)
+        if not metric:
+            return "n/a"
+        number = metric["percentile"] / divisor
+        return f"{number:.{decimals}f}{unit}" if divisor != 1 else f"{number:.0f}{unit}"
+
+    return {
+        "LCP": value("LARGEST_CONTENTFUL_PAINT_MS", 1000, "s"),
+        "CLS": value("CUMULATIVE_LAYOUT_SHIFT_SCORE", 100, "", 2),
+        "INP": value("INTERACTION_TO_NEXT_PAINT", 1, "ms"),
+    }
+
+
+def main():
+    url = os.environ["MSSH_URL"]
+    api_key = os.environ.get("PAGESPEED_API_KEY", "").strip()
+
+    for strategy in ("mobile", "desktop"):
+        try:
+            data = fetch(url, strategy, api_key)
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", "replace")
+            try:
+                detail = json.loads(body)["error"]["message"]
+            except (ValueError, KeyError, TypeError):
+                detail = " ".join(body.split())
+            print(f"ERR|{strategy}|HTTP {error.code}: {detail[:120]}")
+            continue
+        except Exception as error:                             # noqa: BLE001
+            print(f"ERR|{strategy}|{error}")
+            continue
+
+        score = scores(data)
+        vital = vitals(data)
+        print("OK|{}|{}|{}|{}|{}|{}|{}|{}".format(
+            strategy,
+            score.get("performance", "n/a"),
+            score.get("accessibility", "n/a"),
+            score.get("best-practices", "n/a"),
+            score.get("seo", "n/a"),
+            vital["LCP"], vital["CLS"], vital["INP"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+}
+
+# _pagespeed_check <url> <history_file> — returns 1 if a run failed or scored poorly.
+_pagespeed_check() {
+    local url="$1" history="$2"
+    local status=0
+
+    command -v python3 &>/dev/null || { warn "  python3 not installed — skipped."; return 0; }
+
+    # Key is optional: Google allows a small keyless quota, but a key avoids
+    # the 429s that show up as soon as the check runs regularly.
+    if [[ -z "${PAGESPEED_API_KEY:-}" && -f "${CONFIG_DIR}/.env" ]]; then
+        PAGESPEED_API_KEY=$(grep '^PAGESPEED_API_KEY=' "${CONFIG_DIR}/.env" 2>/dev/null \
+                            | head -1 | cut -d'=' -f2- || true)
+        export PAGESPEED_API_KEY
+    fi
+
+    printf "  ${DIM}Running Lighthouse for %s (takes up to a minute)...${NC}\n\n" "${url}"
+
+    local results
+    results=$(MSSH_URL="${url}" _pagespeed_fetch) || {
+        err "  PageSpeed request failed."
+        return 1
+    }
+
+    printf "  ${BOLD}%-9s %5s %5s %5s %5s   %7s %6s %8s${NC}\n" \
+        "DEVICE" "PERF" "A11Y" "BP" "SEO" "LCP" "CLS" "INP"
+
+    local today; today=$(date '+%Y-%m-%d')
+    local wrote_header=false
+    [[ -f "${history}" ]] || wrote_header=true
+
+    while IFS='|' read -r kind strategy a b c d e f g; do
+        if [[ "${kind}" == "ERR" ]]; then
+            err "  ${strategy}: ${a}"
+            status=1
+            continue
+        fi
+        [[ "${kind}" == "OK" ]] || continue
+
+        local color="${GREEN}"
+        if [[ "${a}" =~ ^[0-9]+$ ]]; then
+            if   (( a < 50 )); then color="${RED}";    status=1
+            elif (( a < 90 )); then color="${YELLOW}"; fi
+        fi
+        printf "  %-9s ${color}%5s${NC} %5s %5s %5s   %7s %6s %8s\n" \
+            "${strategy}" "${a}" "${b}" "${c}" "${d}" "${e}" "${f}" "${g:-n/a}"
+
+        if [[ -n "${history}" ]]; then
+            mkdir -p "$(dirname "${history}")"
+            if [[ "${wrote_header}" == true ]]; then
+                {
+                    printf '# PageSpeed history\n\n'
+                    printf '| Date | URL | Device | Performance | Accessibility | Best Practices | SEO | LCP | CLS | INP |\n'
+                    printf '|---|---|---|---|---|---|---|---|---|---|\n'
+                } > "${history}"
+                wrote_header=false
+            fi
+            printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+                "${today}" "${url}" "${strategy}" "${a}" "${b}" "${c}" "${d}" "${e}" "${f}" "${g:-n/a}" \
+                >> "${history}"
+        fi
+    done <<< "${results}"
+
+    printf '\n'
+    if [[ ${status} -eq 0 ]]; then
+        ok "  Performance is in the green on both devices."
+    else
+        warn "  Performance below 50 on at least one device."
+    fi
+    [[ -n "${history}" ]] && printf "  ${DIM}History: %s${NC}\n" "${history}"
+    return ${status}
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1930,7 +2114,7 @@ ${BOLD}Commands:${NC}
   ${CYAN}filezilla${NC} <name>         Open server in FileZilla (SFTP)
   ${CYAN}tunnel${NC}   <name>          Create SSH tunnel to remote DB (localhost:TUNNEL_LOCAL_PORT)
   ${CYAN}dbeaver${NC}  <name>          Open tunnel + launch DBeaver with DB connection
-  ${CYAN}housekeeping${NC} <name>     Indexers + disk + SSL expiry + exception.log report
+  ${CYAN}housekeeping${NC} <name>     Indexers + disk + SSL + PageSpeed + exception.log report
   ${CYAN}report${NC} <name>            Prioritized exception.log report as xlsx
   ${CYAN}version${NC}                  Print version and check for updates
   ${CYAN}update${NC}                   Update magneto-ssh to latest version
@@ -1956,6 +2140,8 @@ ${BOLD}housekeeping options:${NC}
   --no-report       Skip the xlsx exception report (built by default)
   --no-ssl          Skip the SSL certificate expiry check
   --domain HOST     Check this host's certificate instead of FRONTEND_URL's
+  --no-pagespeed    Skip the PageSpeed Insights run
+  --url URL         Measure this URL instead of FRONTEND_URL
 
 ${BOLD}report options:${NC}
   --file PATH       Analyse a local log instead of downloading one
@@ -1964,6 +2150,10 @@ ${BOLD}report options:${NC}
   --top N           Keep only the N most frequent issues
   --rules           Skip Gemini, prioritize by log level only
   --open            Open the xlsx when it is done
+
+${BOLD}PageSpeed:${NC}  export PAGESPEED_API_KEY=...  (or put it in ~/.magneto-ssh/.env)
+  Key from https://console.cloud.google.com — optional, but without one Google
+  rate-limits the anonymous quota quickly.
 
 ${BOLD}Gemini:${NC}  export GEMINI_API_KEY=...   (key from https://aistudio.google.com/apikey)
   Priorities are cached in ~/.magneto-ssh/priority-map.json, so repeat errors
