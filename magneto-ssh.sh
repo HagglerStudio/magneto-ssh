@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION="1.8.000"
+VERSION="1.9.000"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 CONFIG_DIR="${HOME}/.magneto-ssh"
@@ -146,6 +146,12 @@ cmd_add() {
     printf "  Disk usage path (for df -h) [~/application/]: "
     read -r disk_path
 
+    # ── Housekeeping sheet (optional) ────────────────────────────────────────
+    local hk_sheet_url hk_sheet_file
+    printf "\n${DIM}  Housekeeping report sheet (optional):${NC}\n"
+    printf "  Sheet URL (Google Sheets link): ";       read -r hk_sheet_url
+    printf "  Local .xlsx copy of the sheet (path): "; read -r hk_sheet_file
+
     # ── Database (optional) ──────────────────────────────────────────────────
     local db_host db_port db_name db_user db_password
     printf "\n${DIM}  Database (optional):${NC}\n"
@@ -178,6 +184,8 @@ DB_NAME=${db_name}
 DB_USER=${db_user}
 DB_PASSWORD=${db_password}
 DISK_PATH=${disk_path}
+HK_SHEET_URL=${hk_sheet_url}
+HK_SHEET_FILE=${hk_sheet_file}
 EOF
 
     printf '\n'; ok "Server ${CYAN}${name}${NC} saved.\n"
@@ -197,6 +205,7 @@ cmd_update() {
     local cur_project_dir cur_admin_url cur_admin_user cur_admin_password
     local cur_frontend_url cur_git_token
     local cur_db_host cur_db_port cur_db_name cur_db_user cur_db_password cur_disk_path
+    local cur_hk_sheet_url cur_hk_sheet_file
 
     cur_host=$(read_field "${file}" HOST)
     cur_port=$(read_field "${file}" PORT)
@@ -216,6 +225,8 @@ cmd_update() {
     cur_db_user=$(read_field "${file}" DB_USER)
     cur_db_password=$(read_field "${file}" DB_PASSWORD)
     cur_disk_path=$(read_field "${file}" DISK_PATH)
+    cur_hk_sheet_url=$(read_field "${file}" HK_SHEET_URL)
+    cur_hk_sheet_file=$(read_field "${file}" HK_SHEET_FILE)
 
     # ── Field picker ─────────────────────────────────────────────────────────
     printf "\n${BOLD}Edit server:${NC} ${CYAN}%s${NC}\n" "${name}"
@@ -240,6 +251,8 @@ cmd_update() {
         "DB User         [${cur_db_user}]"
         "DB Password     $([ -n "${cur_db_password}" ] && echo "[set]" || echo "[not set]")"
         "Disk Path       [${cur_disk_path}]"
+        "HK Sheet URL    [${cur_hk_sheet_url}]"
+        "HK Sheet File   [${cur_hk_sheet_file}]"
     )
 
     local -a chosen_indices=()
@@ -372,6 +385,16 @@ cmd_update() {
         disk_path="${disk_path:-${cur_disk_path}}"
     fi
 
+    local hk_sheet_url="${cur_hk_sheet_url}" hk_sheet_file="${cur_hk_sheet_file}"
+    if _field_is_chosen 19; then
+        printf "  Housekeeping sheet URL [%s]: " "${cur_hk_sheet_url}"; read -r hk_sheet_url
+        hk_sheet_url="${hk_sheet_url:-${cur_hk_sheet_url}}"
+    fi
+    if _field_is_chosen 20; then
+        printf "  Local .xlsx copy of the sheet [%s]: " "${cur_hk_sheet_file}"; read -r hk_sheet_file
+        hk_sheet_file="${hk_sheet_file:-${cur_hk_sheet_file}}"
+    fi
+
     [[ "${auth_type}" == "ssh_key" ]] && password=""
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -394,6 +417,8 @@ DB_NAME=${db_name}
 DB_USER=${db_user}
 DB_PASSWORD=${db_password}
 DISK_PATH=${disk_path}
+HK_SHEET_URL=${hk_sheet_url}
+HK_SHEET_FILE=${hk_sheet_file}
 EOF
 
     if [[ "${new_name}" != "${name}" ]]; then
@@ -564,10 +589,11 @@ cmd_info() {
         [HOST]="Host" [PORT]="Port" [USER]="User" [AUTH_TYPE]="Auth type"
         [SSH_KEY]="SSH key" [PROJECT_DIR]="Project dir"
         [ADMIN_URL]="Admin URL" [ADMIN_USER]="Admin user" [FRONTEND_URL]="Frontend URL"
-        [DISK_PATH]="Disk path"
+        [DISK_PATH]="Disk path" [HK_SHEET_URL]="HK sheet URL" [HK_SHEET_FILE]="HK sheet file"
     )
     local field_order=(HOST PORT USER AUTH_TYPE SSH_KEY PROJECT_DIR
-                       ADMIN_URL ADMIN_USER FRONTEND_URL DISK_PATH)
+                       ADMIN_URL ADMIN_USER FRONTEND_URL DISK_PATH
+                       HK_SHEET_URL HK_SHEET_FILE)
 
     for field in "${field_order[@]}"; do
         local val; val=$(read_field "${file}" "${field}")
@@ -922,6 +948,8 @@ _ssl_check() {
     }
     now_epoch=$(date +%s)
     days=$(( (end_epoch - now_epoch) / 86400 ))
+    HK_SSL_EXPIRES=$(date -d "${not_after}" '+%Y-%m-%d')
+    HK_SSL_DAYS="${days}"
 
     if (( days < 0 )); then
         err "  Certificate EXPIRED ${days#-} day(s) ago."
@@ -941,6 +969,11 @@ cmd_housekeeping() {
     local name="" tail_lines=20 download=true out_dir="" log_path="" disk_path_override=""
     local make_report=true check_ssl=true domain_override=""
     local check_speed=true url_override="" check_uptime=true
+    local make_sheet=true sheet_override="" period_since="" sheet_upload=1
+
+    # Values the checks below leave behind for the sheet step (8).
+    HK_SSL_EXPIRES="" HK_SSL_DAYS="" HK_PS_MOBILE="" HK_PS_DESKTOP=""
+    HK_UPTIME_STATE="" HK_UPTIME_RATIO="" HK_UPTIME_EVENTS=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -957,12 +990,16 @@ cmd_housekeeping() {
             --url)           url_override="${2:-}"; shift 2 ;;
             --no-uptime)     check_uptime=false; shift ;;
             --rules)         REPORT_CLASSIFIER="rules"; shift ;;
+            --no-sheet)      make_sheet=false; shift ;;
+            --no-upload)     sheet_upload=0; shift ;;
+            --sheet)         sheet_override="${2:-}"; shift 2 ;;
+            --since)         period_since="${2:-}"; shift 2 ;;
             *)               [[ -z "${name}" ]] && name="$1"; shift ;;
         esac
     done
 
     [[ -n "${name}" ]] || die "Usage: magneto-ssh housekeeping <name> [--tail N] [--no-download] [--no-report] [--no-ssl] [--no-pagespeed] [--no-uptime]
-       [--output DIR] [--log PATH] [--disk PATH] [--domain HOST] [--url URL]"
+       [--no-sheet] [--no-upload] [--sheet FILE] [--since DATE] [--output DIR] [--log PATH] [--disk PATH] [--domain HOST] [--url URL]"
     server_exists "${name}" || die "Server '${name}' not found. Run: magneto-ssh list"
 
     local file; file=$(server_file "${name}")
@@ -992,12 +1029,18 @@ cmd_housekeeping() {
 set -u
 cd ${q_project} 2>/dev/null || { echo "__ERR__ project dir not found: ${project_dir}"; }
 
+PHP_BIN=""
+for c in php php8.4 php8.3 php8.2 php8.1 php8.0 php7.4; do
+    command -v "\$c" >/dev/null 2>&1 && { PHP_BIN="\$c"; break; }
+done
+
+echo "__SECTION__VERSION"
+if [ -n "\$PHP_BIN" ] && [ -f ${q_project}/bin/magento ]; then
+    "\$PHP_BIN" ${q_project}/bin/magento --version 2>/dev/null
+fi
+
 echo "__SECTION__INDEXER"
 if [ -f ${q_project}/bin/magento ]; then
-    PHP_BIN=""
-    for c in php php8.4 php8.3 php8.2 php8.1 php8.0 php7.4; do
-        command -v "\$c" >/dev/null 2>&1 && { PHP_BIN="\$c"; break; }
-    done
     if [ -n "\$PHP_BIN" ]; then
         "\$PHP_BIN" ${q_project}/bin/magento indexer:status 2>&1
     else
@@ -1036,6 +1079,8 @@ REMOTE
 
     local exit_status=0
     local downloaded_log=""
+    local magento_version indexer_ok="" indexer_bad_names="" disk_pct=""
+    magento_version=$(_hk_section VERSION | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-p[0-9]+)?' | head -1 || true)
 
     # ── 1. Indexer status ────────────────────────────────────────────────────
     printf "${BOLD}1) Indexer status${NC}\n"
@@ -1054,8 +1099,13 @@ REMOTE
             err "  ${bad_count} indexer(s) NOT ready:"
             printf '%s\n' "${bad}" | sed 's/^/    /'
             exit_status=1
+            indexer_ok=0
+            # Table rows look like "| Catalog Search | Reindex required | ..."
+            indexer_bad_names=$(printf '%s\n' "${bad}" \
+                | awk -F'|' 'NF>2 {gsub(/^ +| +$/,"",$2); print $2}' | paste -sd, - || true)
         else
             ok "  All indexers Ready."
+            indexer_ok=1
         fi
     fi
     printf '\n'
@@ -1072,6 +1122,7 @@ REMOTE
         local use_pct
         use_pct=$(printf '%s\n' "${disk}" | awk 'NR>1 {for(i=1;i<=NF;i++) if($i ~ /%$/){gsub("%","",$i); print $i; exit}}')
         if [[ "${use_pct}" =~ ^[0-9]+$ ]]; then
+            disk_pct="${use_pct}"
             if (( use_pct >= 90 )); then
                 err "  Disk ${use_pct}% used — critical."
                 exit_status=1
@@ -1184,12 +1235,686 @@ REMOTE
         printf '\n'
     fi
 
+    # ── 8. Housekeeping sheet tab ────────────────────────────────────────────
+    if [[ "${make_sheet}" == true ]]; then
+        local sheet_url sheet_file
+        sheet_url=$(read_field "${file}" HK_SHEET_URL)
+        sheet_file="${sheet_override:-$(read_field "${file}" HK_SHEET_FILE)}"
+        sheet_file="${sheet_file/#\~/${HOME}}"
+
+        if [[ -n "${sheet_url}" || -n "${sheet_file}" ]]; then
+            printf "${BOLD}8) Housekeeping sheet${NC}\n"
+            if [[ -n "${sheet_file}" && ! -f "${sheet_file}" ]]; then
+                err "  Sheet file not found: ${sheet_file}"
+                exit_status=1
+            else
+                local sheet_out="${CONFIG_DIR}/reports/${name}"
+                mkdir -p "${sheet_out}"
+                MSSH_SHEET_FILE="${sheet_file}" \
+                MSSH_OUT="${sheet_out}/housekeeping-$(date '+%Y%m%d-%H%M%S').xlsx" \
+                MSSH_BACKUP_DIR="${sheet_out}" \
+                MSSH_UPLOAD="${sheet_upload}" \
+                MSSH_LABEL="${name}" \
+                MSSH_URL="$(read_field "${file}" FRONTEND_URL)" \
+                MSSH_SINCE="${period_since}" \
+                MSSH_VERSION="${magento_version}" \
+                MSSH_UPTIME_STATE="${HK_UPTIME_STATE}" \
+                MSSH_UPTIME_RATIO="${HK_UPTIME_RATIO}" \
+                MSSH_UPTIME_EVENTS="${HK_UPTIME_EVENTS}" \
+                MSSH_PS_MOBILE="${HK_PS_MOBILE}" \
+                MSSH_PS_DESKTOP="${HK_PS_DESKTOP}" \
+                MSSH_DISK_PCT="${disk_pct}" \
+                MSSH_SSL_EXPIRES="${HK_SSL_EXPIRES}" \
+                MSSH_SSL_DAYS="${HK_SSL_DAYS}" \
+                MSSH_INDEXER_OK="${indexer_ok}" \
+                MSSH_INDEXER_BAD="${indexer_bad_names}" \
+                MSSH_LOG_NAME="$( [[ -n "${downloaded_log}" ]] && basename "${downloaded_log%.log}" || true )" \
+                _hk_sheet_tab "${sheet_url}" || exit_status=1
+            fi
+            printf '\n'
+        fi
+    fi
+
     if [[ ${exit_status} -eq 0 ]]; then
         ok "Housekeeping clean for ${CYAN}${name}${NC}.\n"
     else
         warn "Housekeeping found issues on ${CYAN}${name}${NC}.\n"
     fi
     return ${exit_status}
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Housekeeping sheet tab ───────────────────────────────────────────────────
+
+# Builds the next period's tab of the weekly housekeeping report. With a local
+# .xlsx copy of the Google Sheet (MSSH_SHEET_FILE) it clones the newest report
+# tab and fills in the measured cells, so the manual rows carry over; without
+# one it writes a fresh single-tab workbook to MSSH_OUT. All inputs are
+# MSSH_* env vars; an empty value leaves that cell as it was.
+_hk_sheet_fill() {
+    python3 - <<'PYEOF'
+import datetime as dt
+import os
+import re
+import shutil
+import sys
+from copy import copy
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+env = os.environ.get
+
+METRIC_HEADERS = ("Metric", "Details / Check Performed", "", "Status",
+                  "Evidence / Reference", "Observations / Comments")
+METRIC_ROWS = (
+    ("Platform Uptime", "Uptime validation for last 7 days (UptimeRobot)"),
+    ("Site Performance", "Core Web Vitals & Google PageSpeed scores (Mobile/Desktop)"),
+    ("Security Posture", "Adobe Security Scanner + OWASP checks"),
+    ("Backup Status", "Server backups"),
+    ("Disk Usage", "Production server disk utilization"),
+    ("SSL Certificate", "SSL validity & auto-renewal configuration"),
+    ("Cron & Queue", "Magento cron jobs & message queue status"),
+    ("Indexer Status", "All Magento indexers up to date"),
+    ("Patch Level", "Magento & third-party extension patches"),
+    ("Exception Logs Report", ""),
+)
+INCIDENT_HEADERS = ("Issue / Risk Description", "Status", "Owner",
+                    "Raised Date", "ETA", "Comments / Evidence")
+
+
+def parse_date(value):
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    text = str(value or "").strip()
+    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return dt.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def ordinal(day):
+    suffix = "th" if 11 <= day % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def period_label(start, end):
+    if (start.year, start.month) == (end.year, end.month):
+        return f"{ordinal(start.day)} - {ordinal(end.day)} {end:%B %Y}"
+    if start.year == end.year:
+        return f"{ordinal(start.day)} {start:%B} - {ordinal(end.day)} {end:%B %Y}"
+    return f"{ordinal(start.day)} {start:%B %Y} - {ordinal(end.day)} {end:%B %Y}"
+
+
+def date_like(day, previous):
+    """Write a date the same way the previous tab did: real date or dd-mon-yyyy text."""
+    if isinstance(previous, (dt.datetime, dt.date)):
+        return dt.datetime(day.year, day.month, day.day)
+    return day.strftime("%d-%b-%Y").lower()
+
+
+def find_label(ws, label, column=None, min_row=1, exact=False):
+    needle = label.strip().lower()
+    for row in ws.iter_rows(min_row=min_row, max_row=min(ws.max_row, 300)):
+        for cell in row:
+            if column and cell.column != column:
+                continue
+            if not isinstance(cell.value, str):
+                continue
+            text = cell.value.strip().lower()
+            if text == needle or (not exact and text.startswith(needle)):
+                return cell
+    return None
+
+
+def existing_status(ws, column, wanted):
+    """Reuse the sheet's own spelling of a status (dropdown lists are picky)."""
+    for row in ws.iter_rows(min_col=column, max_col=column):
+        value = row[0].value
+        if isinstance(value, str) and value.strip().lower() == wanted.lower():
+            return value
+    return wanted
+
+
+def as_int(text):
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def fill_note(ws, row, text):
+    """Write into the Observations column of a metric row, if the header exists."""
+    header = find_label(ws, "Metric")
+    if header is None:
+        return
+    for cell in ws[header.row]:
+        if isinstance(cell.value, str) and cell.value.strip().lower().startswith("observations"):
+            ws.cell(row, cell.column).value = text
+            return
+
+
+def fill_header(ws, today, since):
+    """Report Date / Reporting Period / Next Review / Platform / Website URL."""
+    report_cell = find_label(ws, "Report Date")
+    previous_date = ws.cell(report_cell.row, report_cell.column + 1).value if report_cell else None
+
+    start = parse_date(since) if since else None
+    if start is None:
+        last = parse_date(previous_date)
+        start = last + dt.timedelta(days=1) if last else today - dt.timedelta(days=6)
+    if start > today:
+        start = today
+
+    if report_cell:
+        ws.cell(report_cell.row, report_cell.column + 1).value = date_like(today, previous_date)
+
+    period_cell = find_label(ws, "Reporting Period")
+    if period_cell:
+        ws.cell(period_cell.row, period_cell.column + 1).value = period_label(start, today)
+
+    review_cell = find_label(ws, "Next Review")
+    if review_cell:
+        target = ws.cell(review_cell.row, review_cell.column + 1)
+        target.value = date_like(today + dt.timedelta(days=7), target.value)
+
+    version = env("MSSH_VERSION", "").strip()
+    platform_cell = find_label(ws, "Platform", exact=True)
+    if platform_cell and version:
+        target = ws.cell(platform_cell.row, platform_cell.column + 1)
+        current = str(target.value or "")
+        if re.search(r"\d+\.\d+\.\d+(-p\d+)?", current):
+            target.value = re.sub(r"\d+\.\d+\.\d+(-p\d+)?", version, current, count=1)
+        else:
+            target.value = f"Magento Open Source {version}"
+
+    if version:
+        patch_cell = find_label(ws, "Patch Level", exact=True)
+        if patch_cell:
+            fill_note(ws, patch_cell.row, version)
+
+    url = env("MSSH_URL", "").strip()
+    url_cell = find_label(ws, "Website URL")
+    if url_cell and url:
+        ws.cell(url_cell.row, url_cell.column + 1).value = url
+
+    return period_label(start, today)
+
+
+def fill_metrics(ws):
+    header = find_label(ws, "Metric")
+    if header is None:
+        return
+    columns = {}
+    for cell in ws[header.row]:
+        if isinstance(cell.value, str):
+            columns[cell.value.strip().lower().split(" ")[0]] = cell.column
+    status_col = columns.get("status")
+    evidence_col = columns.get("evidence")
+    notes_col = columns.get("observations")
+    metric_col = header.column
+
+    def row_of(label):
+        cell = find_label(ws, label, column=metric_col, min_row=header.row + 1)
+        return cell.row if cell else None
+
+    def put(label, status=None, evidence=None, note=None):
+        row = row_of(label)
+        if row is None:
+            return
+        if status and status_col:
+            ws.cell(row, status_col).value = existing_status(ws, status_col, status)
+        if evidence and evidence_col:
+            ws.cell(row, evidence_col).value = evidence
+        if note and notes_col:
+            ws.cell(row, notes_col).value = note
+
+    # Uptime
+    ratio = env("MSSH_UPTIME_RATIO", "").strip()
+    if ratio:
+        events = as_int(env("MSSH_UPTIME_EVENTS")) or 0
+        down = env("MSSH_UPTIME_STATE", "").lower() != "up"
+        try:
+            number = float(ratio)
+        except ValueError:
+            number = None
+        if down or (number is not None and number < 99.0):
+            status = "Need improvement"
+        else:
+            status = "Healthy"
+        if number is not None and number >= 100:
+            note = "100% uptime maintained."
+        else:
+            note = f"{ratio}% uptime, {events} down event(s)."
+        put("Platform Uptime", status, note=note)
+
+    # PageSpeed
+    mobile, desktop = as_int(env("MSSH_PS_MOBILE")), as_int(env("MSSH_PS_DESKTOP"))
+    if mobile is not None or desktop is not None:
+        scores = [s for s in (mobile, desktop) if s is not None]
+        low = min(scores)
+        if low >= 90:
+            status, suffix = "Healthy", "Good"
+        elif low >= 50:
+            status, suffix = "Stable", "Average"
+        else:
+            status, suffix = "Need improvement", "Needs Improvement"
+        put("Site Performance", status,
+            note=f"Mobile {mobile if mobile is not None else 'n/a'} / "
+                 f"Desktop {desktop if desktop is not None else 'n/a'}. {suffix}")
+
+    # Disk
+    pct = as_int(env("MSSH_DISK_PCT"))
+    if pct is not None:
+        status = "Critical" if pct >= 90 else "Need improvement" if pct >= 80 else "Stable"
+        put("Disk Usage", status, note=f"{pct}% used / {100 - pct}% free.")
+
+    # SSL
+    expires = parse_date(env("MSSH_SSL_EXPIRES", ""))
+    if expires:
+        days = as_int(env("MSSH_SSL_DAYS"))
+        status = "Need improvement" if days is not None and days <= 7 else "Valid"
+        put("SSL Certificate", status, note=f"Expiring {expires.strftime('%d-%b-%Y').lower()}.")
+
+    # Indexers
+    indexer_ok = env("MSSH_INDEXER_OK", "").strip()
+    if indexer_ok == "1":
+        put("Indexer Status", "Healthy", note="No backlog. All in 'Ready' state.")
+    elif indexer_ok == "0":
+        bad = env("MSSH_INDEXER_BAD", "").strip().replace(",", ", ")
+        put("Indexer Status", "Need improvement",
+            note=f"Not ready: {bad}." if bad else "Some indexers are not ready.")
+
+    # Exception log
+    log_name = env("MSSH_LOG_NAME", "").strip()
+    if log_name:
+        put("Exception Logs Report", evidence=log_name)
+
+
+def build_template(ws, label):
+    bold = Font(bold=True)
+    title_font = Font(bold=True, size=14)
+    head_fill = PatternFill("solid", fgColor="D9E1F2")
+    section_fill = PatternFill("solid", fgColor="BDD7EE")
+    thin = Side(style="thin", color="999999")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws.merge_cells("A1:F1")
+    ws["A1"] = f"{label} Magento Open Source - Weekly Housekeeping Report"
+    ws["A1"].font = title_font
+    ws["A1"].alignment = Alignment(horizontal="center")
+
+    header = (("Report Date", "", "Prepared By", ""),
+              ("Reporting Period", "", "Reviewed By", ""),
+              ("Environment", "Production", "Client Owner", ""),
+              ("Platform", "", "Next Review", ""),
+              ("Website URL", "", "", ""))
+    for offset, (left, left_val, right, right_val) in enumerate(header, start=2):
+        ws.cell(offset, 1, left).font = bold
+        ws.cell(offset, 2, left_val)
+        ws.merge_cells(start_row=offset, start_column=2, end_row=offset, end_column=3)
+        if right:
+            ws.cell(offset, 4, right).font = bold
+            ws.cell(offset, 5, right_val)
+            ws.merge_cells(start_row=offset, start_column=5, end_row=offset, end_column=6)
+
+    row = 8
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+    ws.cell(row, 1, "KEY HEALTH INDICATORS").font = bold
+    ws.cell(row, 1).fill = section_fill
+    row += 1
+    for col, text in enumerate(METRIC_HEADERS, start=1):
+        cell = ws.cell(row, col, text)
+        cell.font, cell.fill, cell.border = bold, head_fill, border
+    ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=3)
+    for metric, detail in METRIC_ROWS:
+        row += 1
+        ws.cell(row, 1, metric).font = bold
+        ws.cell(row, 2, detail)
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=3)
+        for col in range(1, 7):
+            ws.cell(row, col).border = border
+            ws.cell(row, col).alignment = Alignment(wrap_text=True, vertical="top")
+
+    row += 2
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+    ws.cell(row, 1, "INCIDENT / RISK REGISTER").font = bold
+    ws.cell(row, 1).fill = section_fill
+    row += 1
+    for col, text in enumerate(INCIDENT_HEADERS, start=1):
+        cell = ws.cell(row, col, text)
+        cell.font, cell.fill, cell.border = bold, head_fill, border
+    for _ in range(3):
+        row += 1
+        for col in range(1, 7):
+            ws.cell(row, col).border = border
+
+    for col, width in zip("ABCDEF", (26, 30, 18, 18, 40, 48)):
+        ws.column_dimensions[col].width = width
+
+
+def safe_title(wb, title):
+    title = re.sub(r"[\\/?*\[\]:]", "-", title)[:31]
+    base, n = title, 2
+    while title in wb.sheetnames:
+        title = f"{base[:28]} ({n})"
+        n += 1
+    return title
+
+
+def main():
+    sheet_file = env("MSSH_SHEET_FILE", "").strip()
+    out_path = env("MSSH_OUT", "").strip()
+    label = env("MSSH_LABEL", "report")
+    today = dt.date.today()
+
+    if sheet_file:
+        wb = load_workbook(sheet_file)
+        source = next((ws for ws in wb.worksheets if find_label(ws, "Report Date")), None)
+        if source is None:
+            print("ERR|no tab with a 'Report Date' cell found in the workbook")
+            return 1
+        if any(getattr(ws, "_images", None) or getattr(ws, "_charts", None)
+               for ws in wb.worksheets):
+            print("WARN|the workbook has images/charts; openpyxl cannot keep them")
+        tab = wb.copy_worksheet(source)
+        # copy_worksheet skips dropdowns and conditional formats; carry them over.
+        for validation in source.data_validations.dataValidation:
+            tab.data_validations.append(copy(validation))
+        for cf_range, rules in source.conditional_formatting._cf_rules.items():
+            for rule in rules:
+                tab.conditional_formatting.add(str(cf_range.sqref), rule)
+        # copy_worksheet appends at the end; newest report goes first.
+        wb.move_sheet(tab, offset=-(len(wb.worksheets) - 1))
+        target = sheet_file
+    else:
+        wb = Workbook()
+        tab = wb.active
+        build_template(tab, label)
+        target = out_path
+
+    period = fill_header(tab, today, env("MSSH_SINCE", "").strip())
+    fill_metrics(tab)
+    tab.title = safe_title(wb, period)
+    wb.active = wb.worksheets.index(tab)
+
+    if sheet_file:
+        backup_dir = env("MSSH_BACKUP_DIR", "").strip()
+        if backup_dir:
+            stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup = os.path.join(backup_dir, f"sheet-backup-{stamp}.xlsx")
+            shutil.copy2(sheet_file, backup)
+            print(f"BACKUP|{backup}")
+    wb.save(target)
+    print(f"OK|{target}|{tab.title}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+}
+
+# ── Google Drive (service account) ───────────────────────────────────────────
+
+# Minimal Drive v3 client: signs a service-account JWT with openssl (no Google
+# SDK needed), then downloads or replaces one file's content by ID.
+#   MSSH_DRIVE_ACTION   download | upload
+#   MSSH_DRIVE_FILE_ID  Drive file ID from the sheet URL
+#   MSSH_DRIVE_LOCAL    local xlsx path to write (download) or send (upload)
+#   MSSH_SA_JSON        path of the service-account key file
+_hk_drive_call() {
+    python3 - <<'PYEOF'
+import base64
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+NATIVE_SHEET = "application/vnd.google-apps.spreadsheet"
+API = "https://www.googleapis.com/drive/v3/files/"
+UPLOAD = "https://www.googleapis.com/upload/drive/v3/files/"
+SCOPE = "https://www.googleapis.com/auth/drive"
+
+
+def b64(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def access_token(account):
+    now = int(time.time())
+    header = b64(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    claims = b64(json.dumps({
+        "iss": account["client_email"], "scope": SCOPE,
+        "aud": account["token_uri"], "iat": now, "exp": now + 3600,
+    }).encode())
+    unsigned = f"{header}.{claims}".encode()
+
+    # mkstemp gives a 0600 file; the key never touches argv.
+    fd, key_path = tempfile.mkstemp(prefix="mssh-sa-")
+    try:
+        os.write(fd, account["private_key"].encode())
+        os.close(fd)
+        signature = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", key_path],
+            input=unsigned, capture_output=True, check=True).stdout
+    finally:
+        os.unlink(key_path)
+
+    body = urllib.parse.urlencode({
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": f"{header}.{claims}.{b64(signature)}",
+    }).encode()
+    with urllib.request.urlopen(urllib.request.Request(account["token_uri"], data=body),
+                                timeout=30) as response:
+        return json.load(response)["access_token"]
+
+
+def call(token, url, data=None, method="GET", content_type=None):
+    headers = {"Authorization": f"Bearer {token}"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    return urllib.request.urlopen(request, timeout=120)
+
+
+def explain(error, email):
+    body = error.read().decode("utf-8", "replace")
+    try:
+        message = json.loads(body)["error"]["message"]
+    except (ValueError, KeyError, TypeError):
+        message = " ".join(body.split())[:160]
+    if error.code == 404:
+        return f"file not found — share the sheet with {email} as Editor"
+    if error.code == 403:
+        return f"permission denied ({message}) — share the sheet with {email} as Editor"
+    return f"HTTP {error.code}: {message}"
+
+
+def main():
+    action = os.environ["MSSH_DRIVE_ACTION"]
+    file_id = os.environ["MSSH_DRIVE_FILE_ID"]
+    local = os.environ["MSSH_DRIVE_LOCAL"]
+    with open(os.environ["MSSH_SA_JSON"]) as handle:
+        account = json.load(handle)
+    email = account.get("client_email", "the service account")
+
+    try:
+        token = access_token(account)
+    except urllib.error.HTTPError as error:
+        print(f"ERR|token request failed: {explain(error, email)}")
+        return 1
+    except (subprocess.CalledProcessError, KeyError, OSError) as error:
+        print(f"ERR|could not sign the service-account JWT: {error}")
+        return 1
+
+    query = urllib.parse.urlencode({"supportsAllDrives": "true",
+                                    "fields": "name,mimeType,modifiedTime"})
+    try:
+        with call(token, f"{API}{file_id}?{query}") as response:
+            meta = json.load(response)
+        print("META|{}|{}|{}".format(meta.get("name", ""), meta.get("mimeType", ""),
+                                     meta.get("modifiedTime", "")))
+        native = meta.get("mimeType") == NATIVE_SHEET
+
+        if action == "download":
+            if native:
+                url = f"{API}{file_id}/export?" + urllib.parse.urlencode({"mimeType": XLSX})
+            elif meta.get("mimeType") == XLSX:
+                url = f"{API}{file_id}?" + urllib.parse.urlencode(
+                    {"alt": "media", "supportsAllDrives": "true"})
+            else:
+                print(f"ERR|not a spreadsheet: {meta.get('mimeType')}")
+                return 1
+            with call(token, url) as response, open(local, "wb") as handle:
+                handle.write(response.read())
+            print(f"OK|{local}")
+            return 0
+
+        if action == "upload":
+            with open(local, "rb") as handle:
+                payload = handle.read()
+            url = f"{UPLOAD}{file_id}?" + urllib.parse.urlencode(
+                {"uploadType": "media", "supportsAllDrives": "true"})
+            with call(token, url, data=payload, method="PATCH", content_type=XLSX) as response:
+                updated = json.load(response)
+            print("OK|{}".format(updated.get("modifiedTime", "")))
+            return 0
+
+        print(f"ERR|unknown action {action}")
+        return 1
+    except urllib.error.HTTPError as error:
+        print(f"ERR|{explain(error, email)}")
+        return 1
+    except urllib.error.URLError as error:
+        print(f"ERR|network error: {error.reason}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+}
+
+# _hk_drive <download|upload> <file_id> <local> — prints one status line.
+# Sets HK_DRIVE_NAME on success. Returns 1 on any failure.
+_hk_drive() {
+    local action="$1" file_id="$2" local_path="$3"
+    local results
+    results=$(MSSH_DRIVE_ACTION="${action}" MSSH_DRIVE_FILE_ID="${file_id}" \
+              MSSH_DRIVE_LOCAL="${local_path}" MSSH_SA_JSON="${GOOGLE_SERVICE_ACCOUNT_JSON}" \
+              _hk_drive_call 2>&1) || {
+        local reason
+        reason=$(printf '%s\n' "${results}" | grep '^ERR|' | head -1 | cut -d'|' -f2- || true)
+        err "  Drive ${action} failed: ${reason:-$(printf '%s\n' "${results}" | tail -n 1)}"
+        return 1
+    }
+    HK_DRIVE_NAME=$(printf '%s\n' "${results}" | grep '^META|' | head -1 | cut -d'|' -f2 || true)
+    return 0
+}
+
+# Pull the file ID out of a Google Sheets / Drive URL (or accept a bare ID).
+_hk_sheet_id() {
+    local url="$1" id=""
+    id=$(printf '%s' "${url}" | grep -oE '/d/[A-Za-z0-9_-]+' | head -1 | cut -c4- || true)
+    [[ -z "${id}" ]] && id=$(printf '%s' "${url}" | grep -oE '[?&]id=[A-Za-z0-9_-]+' | head -1 | cut -d'=' -f2 || true)
+    [[ -z "${id}" && "${url}" =~ ^[A-Za-z0-9_-]{20,}$ ]] && id="${url}"
+    printf '%s' "${id}"
+}
+
+# Resolve the service-account key: env var, ~/.magneto-ssh/.env, or the default path.
+_hk_load_sa_json() {
+    if [[ -z "${GOOGLE_SERVICE_ACCOUNT_JSON:-}" && -f "${CONFIG_DIR}/.env" ]]; then
+        GOOGLE_SERVICE_ACCOUNT_JSON=$(grep '^GOOGLE_SERVICE_ACCOUNT_JSON=' "${CONFIG_DIR}/.env" 2>/dev/null \
+                                      | head -1 | cut -d'=' -f2- || true)
+    fi
+    [[ -z "${GOOGLE_SERVICE_ACCOUNT_JSON:-}" ]] && GOOGLE_SERVICE_ACCOUNT_JSON="${CONFIG_DIR}/google-service-account.json"
+    GOOGLE_SERVICE_ACCOUNT_JSON="${GOOGLE_SERVICE_ACCOUNT_JSON/#\~/${HOME}}"
+    export GOOGLE_SERVICE_ACCOUNT_JSON
+    [[ -f "${GOOGLE_SERVICE_ACCOUNT_JSON}" ]]
+}
+
+# _hk_sheet_tab <sheet_url> — builds the tab and, with a service-account key,
+# updates the Google Drive file in place; otherwise works on the local copy.
+_hk_sheet_tab() {
+    local sheet_url="$1"
+    local upload="${MSSH_UPLOAD:-1}"
+
+    command -v python3 &>/dev/null || { warn "  python3 not installed — skipped."; return 0; }
+    python3 -c "import openpyxl" 2>/dev/null \
+        || { warn "  python3 openpyxl missing — skipped. Run: pip install --user openpyxl"; return 0; }
+
+    local file_id="" use_drive=false
+    [[ -n "${sheet_url}" ]] && file_id=$(_hk_sheet_id "${sheet_url}")
+    if [[ -n "${file_id}" ]] && _hk_load_sa_json; then
+        use_drive=true
+    elif [[ -n "${file_id}" ]]; then
+        printf "  ${DIM}No service-account key at %s — working on the local copy.${NC}\n" \
+            "${GOOGLE_SERVICE_ACCOUNT_JSON}"
+    fi
+
+    local stamp; stamp=$(date '+%Y%m%d-%H%M%S')
+    if [[ "${use_drive}" == true ]]; then
+        local pulled="${MSSH_BACKUP_DIR}/sheet-${stamp}.xlsx"
+        _hk_drive download "${file_id}" "${pulled}" || return 1
+        printf "  %-14s %s\n" "Drive file" "${HK_DRIVE_NAME:-${file_id}}"
+        MSSH_SHEET_FILE="${pulled}"
+        MSSH_BACKUP_DIR=""                  # the download itself is the backup
+    elif [[ -z "${MSSH_SHEET_FILE:-}" ]]; then
+        printf "  ${DIM}No local sheet copy set — building a standalone tab.${NC}\n"
+    fi
+
+    local results
+    results=$(_hk_sheet_fill 2>&1) || {
+        err "  Sheet update failed:"
+        printf '%s\n' "${results}" | tail -n 5 | sed 's/^/    /'
+        return 1
+    }
+
+    local status=0 out_file=""
+    while IFS='|' read -r kind a b; do
+        case "${kind}" in
+            OK)
+                out_file="${a}"
+                printf "  %-14s %s\n" "Tab"  "${b}"
+                printf "  %-14s ${CYAN}%s${NC}\n" "File" "${a}"
+                ;;
+            BACKUP) printf "  %-14s ${DIM}%s${NC}\n" "Backup" "${a}" ;;
+            WARN)   warn "  ${a}" ;;
+            ERR)    err "  ${a}"; status=1 ;;
+        esac
+    done <<< "${results}"
+    [[ ${status} -eq 0 ]] || return 1
+
+    printf '\n'
+    if [[ "${use_drive}" == true ]]; then
+        if [[ "${upload}" == "1" ]]; then
+            _hk_drive upload "${file_id}" "${out_file}" || return 1
+            ok "  Sheet updated on Google Drive."
+        else
+            warn "  --no-upload: sheet not sent to Drive; the filled copy is ${out_file}"
+        fi
+    elif [[ -n "${MSSH_SHEET_FILE:-}" ]]; then
+        printf "  ${DIM}Review the new tab, then in Google Drive: right-click the file →\n"
+        printf "  Manage versions → Upload new version (keeps the same link).${NC}\n"
+    else
+        printf "  ${DIM}Open the xlsx, copy the tab, paste it into a new tab of the sheet.\n"
+        printf "  Set HK Sheet File (magneto-ssh edit %s) to fill a copy of the real sheet instead.${NC}\n" "${MSSH_LABEL:-<name>}"
+    fi
+    [[ -n "${sheet_url}" ]] && printf "  %-14s %s\n" "Sheet" "${sheet_url}"
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1375,6 +2100,7 @@ _uptime_check() {
                 ;;
             OK)
                 got_data=true
+                HK_UPTIME_STATE="${b}" HK_UPTIME_RATIO="${c}" HK_UPTIME_EVENTS="${e}"
                 printf "  %-14s %s\n" "Monitor"  "${a}"
                 printf "  %-14s %s\n" "State"    "${b}"
                 printf "  %-14s %s\n" "Uptime 7d" "${c}%"
@@ -1542,6 +2268,10 @@ _pagespeed_check() {
             continue
         fi
         [[ "${kind}" == "OK" ]] || continue
+        case "${strategy}" in
+            mobile)  HK_PS_MOBILE="${a}" ;;
+            desktop) HK_PS_DESKTOP="${a}" ;;
+        esac
 
         local color="${GREEN}"
         if [[ "${a}" =~ ^[0-9]+$ ]]; then
@@ -2311,7 +3041,7 @@ for s in tree.getroot().iter('Server'):
             (( ++skipped )); continue
         fi
 
-        printf 'HOST=%s\nPORT=%s\nUSER=%s\nAUTH_TYPE=%s\nPASSWORD=%s\nSSH_KEY=%s\nPROJECT_DIR=%s\nADMIN_URL=\nADMIN_USER=\nADMIN_PASSWORD=\nFRONTEND_URL=\nGIT_TOKEN=\nDB_HOST=\nDB_PORT=\nDB_NAME=\nDB_USER=\nDB_PASSWORD=\nTUNNEL_LOCAL_PORT=\nDISK_PATH=\n' \
+        printf 'HOST=%s\nPORT=%s\nUSER=%s\nAUTH_TYPE=%s\nPASSWORD=%s\nSSH_KEY=%s\nPROJECT_DIR=%s\nADMIN_URL=\nADMIN_USER=\nADMIN_PASSWORD=\nFRONTEND_URL=\nGIT_TOKEN=\nDB_HOST=\nDB_PORT=\nDB_NAME=\nDB_USER=\nDB_PASSWORD=\nTUNNEL_LOCAL_PORT=\nDISK_PATH=\nHK_SHEET_URL=\nHK_SHEET_FILE=\n' \
             "${host}" "${port}" "${user}" "${auth}" \
             "${pw}" "${kf}" "${rd}" \
             | write_server "${sl}"
@@ -2379,6 +3109,10 @@ ${BOLD}housekeeping options:${NC}
   --no-pagespeed    Skip the PageSpeed Insights run
   --url URL         Measure this URL instead of FRONTEND_URL
   --no-uptime       Skip the UptimeRobot check
+  --no-sheet        Skip building the housekeeping sheet tab
+  --no-upload       Build the tab but do not push it back to Google Drive
+  --sheet FILE      Local .xlsx copy of the sheet to add the tab to (default HK_SHEET_FILE)
+  --since DATE      Reporting period start, YYYY-MM-DD (default: day after the previous tab)
 
 ${BOLD}report options:${NC}
   --file PATH       Analyse a local log instead of downloading one
@@ -2387,6 +3121,13 @@ ${BOLD}report options:${NC}
   --top N           Keep only the N most frequent issues
   --rules           Skip Gemini, prioritize by log level only
   --open            Open the xlsx when it is done
+
+${BOLD}Housekeeping sheet:${NC}  set HK Sheet URL via magneto-ssh edit <name>
+  With a Google service-account key at ~/.magneto-ssh/google-service-account.json
+  (or GOOGLE_SERVICE_ACCOUNT_JSON=path in ~/.magneto-ssh/.env) and the sheet shared
+  with that account as Editor, each run downloads the sheet, adds the new period's
+  tab with the measured rows filled in, and uploads it back to the same Drive file.
+  Without a key, set HK Sheet File to a local .xlsx copy and upload it yourself.
 
 ${BOLD}PageSpeed:${NC}  export PAGESPEED_API_KEY=...  (or put it in ~/.magneto-ssh/.env)
   Key from https://console.cloud.google.com — optional, but without one Google

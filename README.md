@@ -77,6 +77,7 @@ Interactive prompts collect:
 - Optional: project directory, admin URL/user/password, frontend URL, git token
 - Optional: DB host, DB port, DB name, DB user, DB password
 - Optional: disk usage path used by `housekeeping` (default `~/application/`)
+- Optional: housekeeping sheet URL and a local `.xlsx` copy of it (see below)
 
 ### Connect via SSH
 
@@ -192,7 +193,7 @@ magneto-ssh housekeeping myproject_stage
 magneto-ssh hk myproject_stage
 ```
 
-One SSH round-trip, six checks plus a report:
+One SSH round-trip, six checks, a report and a sheet tab:
 
 1. **exception.log** — reads `<PROJECT_DIR>/var/log/exception.log`, reports size, line count and
    last-modified time, prints the last lines, and downloads a timestamped copy to
@@ -213,6 +214,17 @@ One SSH round-trip, six checks plus a report:
    `--no-uptime`.
 7. **Exception report** — builds the prioritized xlsx described below from the log it just
    downloaded. Skip it with `--no-report`.
+8. **Housekeeping sheet** — adds the next period's tab to your weekly housekeeping report. Set
+   `HK Sheet URL` (the Google Sheets link) and `HK Sheet File` (a local `.xlsx` download of that
+   sheet, File → Download in Google Sheets) with `magneto-ssh edit <name>`. The run clones the
+   newest report tab, names it after the reporting period (`13th - 22nd September 2026`), and
+   fills the cells it measured: report date, period, next review, Magento version, uptime,
+   PageSpeed scores, disk usage, SSL expiry, indexer status and the exception log file name.
+   Everything else (reviewer, backup, security, incident register…) carries over from the
+   previous tab for you to edit. A backup of the file goes to `~/.magneto-ssh/reports/<name>/`
+   first. Upload the file back in Drive with *Manage versions → Upload new version* so the link
+   stays the same. Without `HK Sheet File` a standalone one-tab xlsx is written instead. Skip
+   with `--no-sheet`.
 
 Exits with status `1` when any check fails, so it can be used in scripts.
 
@@ -229,6 +241,9 @@ Exits with status `1` when any check fails, so it can be used in scripts.
 | `--no-pagespeed` | Skip the PageSpeed Insights run |
 | `--url URL` | Measure this URL instead of `FRONTEND_URL` |
 | `--no-uptime` | Skip the UptimeRobot check |
+| `--no-sheet` | Skip the housekeeping sheet tab |
+| `--sheet FILE` | Add the tab to this `.xlsx` instead of `HK Sheet File` |
+| `--since DATE` | Reporting period start (`YYYY-MM-DD`; default: day after the previous tab's report date) |
 
 ### Exception log report
 
@@ -366,7 +381,7 @@ curl -fsSL https://raw.githubusercontent.com/JainamDeveloper/magneto-ssh/main/in
 | `filezilla <name>` | `fz` | Open in FileZilla (SFTP) |
 | `tunnel <name>` | | Create SSH tunnel to remote DB |
 | `dbeaver <name>` | `db` | Open tunnel + launch DBeaver |
-| `housekeeping <name>` | `hk` | Indexer status + disk usage + download exception.log |
+| `housekeeping <name>` | `hk` | Indexers, disk, SSL, PageSpeed, uptime, exception report, sheet tab |
 | `report <name>` | | Prioritized exception.log report as xlsx |
 | `install-completion` | | Install bash tab completion |
 | `upgrade` | | Self-upgrade to latest version |
